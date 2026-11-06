@@ -1,34 +1,50 @@
-# StockExplorer （股探）
+# 股探 · 市场观察工作台
 
-An A-share market dashboard with a **hot-topic stock matching engine**: type in a trending topic (or pick one of the suggested hot-topic keywords), and the app matches it to related concept boards and A-share stocks, ranked by relevance.
+本地 A 股市场工作台，包含指数、自选股、活跃股、分时与 K 线、热点发现和个股速读。
 
-Built as a personal learning project with the help of AI-assisted coding tools, to explore how software can make financial information easier to discover and understand.
+## 启动
 
-## Features
-
-- **Hot-topic matching** — enter a topic such as 人工智能 (AI), 固态电池 (solid-state batteries) or 低空经济 (low-altitude economy), or choose a suggested keyword, and get matched concept boards plus related stocks ranked by a relevance score
-- **Market overview** — real-time quotes for 8 major indices （上证指数， 深证成指， 创业板指， 科创50, 沪深300, 中证500, etc.)
-- **Stock search & watchlist** — search any A-share by name or 6-digit code and keep a personal watchlist
-- **Charts** — intraday minute charts and multi-period K-lines (daily / weekly / monthly) with technical indicators: MA, MACD, RSI, KDJ, BOLL and volume averages, all calculated in the backend
-- **Index constituents & popular stocks** — browse index constituent stocks and a most-active stocks ranking
-- **News search** — finance news related to any keyword or topic
-
-## Tech stack
-
-- **Backend:** Python + Flask, with an in-memory cache layer
-- **Frontend:** vanilla JavaScript + ECharts, custom CSS (light/dark themes)
-- **Data sources:** public APIs from Sina Finance （行情 / K-line / intraday) and Eastmoney （概念板块 / constituents / news); optional DuckDuckGo web search
-
-## Run it locally
-
-```bash
-pip install -r requirements.txt
-python app.py
+```sh
+python3 -m pip install -r requirements.txt
+python3 app.py
 ```
 
-Then open http://localhost:8080 in your browser.
+浏览器打开 http://localhost:8080。服务仅监听本机。
 
-## Notes
+## 自动热门话题
 
-- Market data comes from third-party public APIs and may be delayed or unavailable outside trading hours; figures are shown for learning purposes only.
-- This project is for personal study of software development and financial data. It is **not** investment advice.
+服务运行期间，每 5 分钟在后台抓取东方财富概念板块与新浪财经滚动资讯。话题按板块涨幅、成交额和资讯提及排序，排除部分指数成分、资金分类和昨日表现标签。榜单用于发现活跃板块，不代表全网讨论热度。
+
+页面展示来源、抓取时间及板块涨跌幅；标题链接到原文。成功结果缓存在 `.cache/hot-news.json`，上游失败时保留旧数据并标注缓存。停止服务后不会继续抓取。
+
+行情时段按北京时间显示，仅按周一至周五及交易时段判断，不包含法定节假日日历。指数和个股行情标明实际数据时间。
+
+## 个股速读和可选 AI
+
+每次点开个股都会自动生成行情速读：价格表现、5/20 日均线、最近日线量能与当日价格区间。缺少数据时明确说明；只比较不晚于行情日期的 K 线。速读缓存 5 分钟。
+
+默认使用规则生成，并明确标为“行情速读”。如需真实 AI 短评，复制 `.env.example` 为 `.env`，在本地填入 OpenAI 兼容服务的密钥、接口根地址（通常以 `/v1` 结尾）和模型名，再通过环境变量启动：
+
+```sh
+set -a
+source .env
+set +a
+python3 app.py
+```
+
+只有密钥和模型名同时配置才调用 AI，成功后显示“AI 短评”及模型名。模型服务将收到该股票的公开行情和近期 K 线，不发送自选股列表。服务失败自动回退为行情速读。密钥不进入浏览器，不应提交到版本控制。
+
+所有内容仅供研究参考，不构成投资建议。
+
+## 行情与样本来源
+
+- 指数样本使用中证指数或国证指数的公开样本文件；深市样本下载失败时尝试新浪最新成分页，部分名单会明确标注。成分股面板显示样本日期、来源和展示数量，支持按涨跌幅、总市值排序。
+- 话题搜索分页读取东方财富概念目录，目录不完整时补充公开板块目录；结果只显示沪深 A 股。东方财富资讯返回异常时，尝试新浪快讯或网页搜索，界面标注备用来源。
+- 分时优先使用东方财富分时数据，失败时使用其分钟 K 线。日、周、月 K 线为新浪不复权数据，成交量与详情、分时统一为手。详情页估值与换手率缺失时显示“—”。
+
+## 验证
+
+```sh
+python3 -m unittest discover -s tests -v
+node --check static/js/main.js
+```
