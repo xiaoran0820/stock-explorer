@@ -3,31 +3,50 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>股探 StockExplorer — A股行情 · 自选股 · 技术分析</title>
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="股探，一站式观察 A 股行情、市场热点与个股走势。">
+<title>股探 · 市场观察工作台</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/css/style.css">
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script defer src="/static/vendor/echarts.min.js"></script>
 </head>
 <body>
+<svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+<symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 17 9 12l4 3 7-9M15 6h5v5M4 4v16h16"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M5.5 8a7 7 0 0 1 12-3L20 8M4 16l2.5 3a7 7 0 0 0 12-3"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5ZM20 2v4M18 4h4"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9Z"/></symbol>
+</defs></svg>
+<a class="skip-link" href="#main-content">跳转到主要内容</a>
 
 <!-- ═══════════ 顶部导航条 ═══════════ -->
 <header class="top-bar">
     <div class="top-bar-inner">
-        <h1 class="logo" title="返回首页">📈 股探<span class="ver">v3</span></h1>
+        <button class="logo" title="返回首页" aria-label="股探首页"><span class="brand-mark"><svg><use href="#i-chart"/></svg></span><span>股探<span class="brand-en">STOCK EXPLORER</span></span></button>
+        <nav class="main-tabs" aria-label="主要导航">
+            <button class="mtab active" data-view="market">市场概览</button>
+            <button class="mtab" data-view="discover">热点发现</button>
+            <button class="mtab" data-view="stock-detail" id="tab-stock-detail">个股研究</button>
+        </nav>
+        <div class="global-search search-box">
+            <svg class="icon"><use href="#i-search"/></svg>
+            <input id="global-stock-search" placeholder="搜索股票 / 代码" aria-label="搜索股票" autocomplete="off">
+            <kbd>/</kbd><div id="global-stock-suggestions" class="suggestions"></div>
+        </div>
         <div class="top-actions">
-            <span id="market-time" class="market-time">--</span>
-            <button class="icon-btn" id="btn-density-toggle" title="切换间距: 紧凑/正常/宽松">📏</button>
-            <button class="icon-btn" id="btn-theme-toggle" title="切换深浅色主题">🌙</button>
-            <button class="icon-btn" id="btn-refresh" title="刷新数据">🔄</button>
+            <button class="icon-btn" id="btn-density-toggle" title="切换显示间距" aria-label="切换显示间距">≡</button>
+            <button class="icon-btn" id="btn-theme-toggle" title="切换深浅色主题" aria-label="切换深浅色主题">◐</button>
+            <button class="icon-btn" id="btn-refresh" title="刷新数据" aria-label="刷新数据"><svg class="icon"><use href="#i-refresh"/></svg></button>
         </div>
     </div>
 </header>
-
 <!-- ═══════════ 自选股横向条 ═══════════ -->
 <div id="wl-strip" class="wl-strip">
     <div class="wl-strip-header">
-        <span class="wl-strip-title">⭐ 自选</span>
+        <span class="wl-strip-title"><svg class="icon"><use href="#i-star"/></svg> 自选观察</span>
         <div class="wl-strip-search-wrapper">
-            <input type="text" id="wl-strip-add-input" class="wl-strip-search"
+            <input type="text" id="wl-strip-add-input" class="wl-strip-search" aria-label="添加自选股票"
                    placeholder="添加代码/名称..." autocomplete="off">
             <div id="wl-strip-suggestions" class="wl-strip-suggestions"></div>
         </div>
@@ -35,7 +54,7 @@
         <button class="text-btn" id="btn-clear-watchlist-strip">清空</button>
     </div>
     <div id="wl-strip-items" class="wl-strip-items">
-        <span class="wl-strip-empty">暂无自选股</span>
+        <span class="wl-strip-empty">添加第一只自选股，关注它的每一次变化</span>
     </div>
 </div>
 
@@ -45,7 +64,7 @@
     <!-- 左侧边栏：热门人气股 -->
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-header">
-            <h3>🔥 热门人气股</h3>
+            <div><span class="eyebrow">MARKET ACTIVITY</span><h3>活跃个股</h3></div><span class="small-badge">成交量排行</span>
         </div>
         <div id="popular-stocks" class="popular-stocks">
             <div class="watchlist-empty">加载中...</div>
@@ -57,19 +76,18 @@
     </aside>
 
     <!-- 右侧主区域 -->
-    <main class="main-content">
-
-        <!-- 顶部导航Tab -->
-        <nav class="main-tabs">
-            <button class="mtab active" data-view="market">🏛️ 大盘</button>
-            <button class="mtab" data-view="discover">💡 掘金</button>
-            <button class="mtab" data-view="stock-detail" id="tab-stock-detail" disabled>📊 个股</button>
-        </nav>
+    <main class="main-content" id="main-content">
 
         <!-- ═══════════ 大盘视图 ═══════════ -->
         <div id="view-market" class="view active">
-            <!-- 指数详情卡片 -->
-            <div class="index-cards" id="index-cards"></div>
+            <section class="overview-heading">
+                <div><span class="eyebrow">YOUR DAILY MARKET PERSPECTIVE</span><h2>市场脉搏<span class="heading-dot">.</span></h2><p>看清市场动向，发现值得关注的线索。</p></div>
+                <div class="session-box"><span id="market-time" class="market-time">时段参考 · 北京时间</span><span id="market-date"></span></div>
+            </section>
+            <div class="section-heading"><h3>核心指数</h3><span id="index-update" class="muted">正在连接行情源…</span></div>
+            <div class="index-cards" id="index-cards" aria-live="polite">
+                {% for i in range(8) %}<div class="idx-card skeleton-card"><i></i><i></i><i></i></div>{% endfor %}
+            </div>
 
             <!-- 选中指数的成分股 -->
             <div id="constituents-panel" class="constituents-panel hidden">
@@ -77,40 +95,48 @@
                     <h3 id="constituents-title">成分股</h3>
                     <button class="close-btn" id="btn-close-constituents">✕</button>
                 </div>
+                <p id="constituents-meta" class="panel-footnote" aria-live="polite"></p>
                 <div class="stock-table-wrap">
                     <table class="stock-table">
                         <thead><tr>
-                            <th>代码</th><th>名称</th><th>最新价</th><th>涨跌幅</th>
-                            <th>成交量</th><th>总市值</th>
+                            <th>代码</th><th>名称</th><th>最新价</th><th><button type="button" class="sort-button" data-index-sort="change_pct">涨跌幅 ↕</button></th>
+                            <th>成交量</th><th><button type="button" class="sort-button" data-index-sort="market_cap">总市值 ↕</button></th>
                         </tr></thead>
                         <tbody id="constituents-body"></tbody>
                     </table>
                 </div>
             </div>
 
-            <!-- 热门资讯 -->
-            <div class="hot-section">
-                <h3>🔥 热门资讯</h3>
-                <div id="hot-news" class="news-grid"></div>
-                <h3 class="hot-section-gap">🏷️ 今日热门话题</h3>
-                <div id="hot-topics" class="hot-topics"></div>
+            <div class="market-intelligence">
+                <section class="news-panel surface">
+                    <div class="section-heading"><div><span class="eyebrow">THE MARKET BRIEF</span><h3>市场快讯</h3></div><span class="live-label"><i></i> 自动更新</span></div>
+                    <div id="hot-news" class="news-grid" aria-live="polite"><div class="data-state">正在获取市场资讯…</div></div>
+                    <div class="panel-footnote">聚合公开财经资讯 · 点击标题阅读原文</div>
+                </section>
+                <section class="topics-panel surface">
+                    <div class="section-heading"><div><span class="eyebrow">TRENDING NOW</span><h3>热点雷达</h3></div><button class="icon-btn" id="btn-refresh-topics" title="更新热门话题" aria-label="更新热门话题"><svg class="icon"><use href="#i-refresh"/></svg></button></div>
+                    <p class="panel-description">从板块动向中，捕捉市场焦点</p>
+                    <div id="hot-topics" class="hot-topics" aria-live="polite"><div class="data-state">正在发现热门话题…</div></div>
+                    <div class="panel-footnote" id="topics-update">每 5 分钟自动抓取</div>
+                </section>
             </div>
         </div>
 
         <!-- ═══════════ 掘金视图 ═══════════ -->
         <div id="view-discover" class="view">
-            <div class="search-box">
-                <input type="text" id="topic-search-input" class="search-input"
+            <div class="view-heading"><span class="eyebrow">CONNECT THE DOTS</span><h2>发现市场线索<span class="heading-dot">.</span></h2><p>一个话题，连接相关概念、公司与资讯。</p></div>
+            <div class="search-box topic-search-box">
+                <input type="text" id="topic-search-input" aria-label="搜索市场话题" class="search-input"
                        placeholder="输入话题，如：固态电池 / 低空经济 / 机器人概念..."
                        autocomplete="off">
-                <button id="topic-search-btn" class="search-btn">🔎 智能匹配</button>
+                <button id="topic-search-btn" class="search-btn">探索话题 ↗</button>
             </div>
 
             <!-- 默认推荐内容 -->
             <div id="discover-default" class="discover-default">
-                <h3 class="section-title">🔥 今日热门话题</h3>
+                <h3 class="section-title">市场热门话题</h3>
                 <div id="discover-hot-topics" class="hot-topics"></div>
-                <h3 class="section-title hot-section-gap">📈 热门活跃股</h3>
+                <h3 class="section-title hot-section-gap">活跃个股</h3>
                 <div class="stock-table-wrap">
                     <table class="stock-table">
                         <thead><tr><th>代码</th><th>名称</th><th>最新价</th><th>涨跌幅</th><th>成交量</th></tr></thead>
@@ -119,9 +145,10 @@
                 </div>
             </div>
 
+            <div id="topic-source-status" class="panel-footnote hidden" aria-live="polite"></div>
             <div id="topic-concepts" class="topic-concepts hidden"></div>
             <div id="topic-stocks-section" class="topic-section hidden">
-                <h3 class="section-title">📌 相关股票 <span id="topic-stocks-count"></span></h3>
+                <h3 class="section-title">相关股票 <span id="topic-stocks-count"></span></h3>
                 <div class="stock-table-wrap">
                     <table class="stock-table">
                         <thead><tr><th>代码</th><th>名称</th><th>最新价</th><th>涨跌幅</th><th>匹配原因</th><th>相关度</th></tr></thead>
@@ -130,7 +157,8 @@
                 </div>
             </div>
             <div id="topic-news-section" class="topic-section hidden">
-                <h3 class="section-title">📰 相关资讯</h3>
+                <h3 class="section-title">相关资讯</h3>
+                <p id="topic-news-status" class="panel-footnote"></p>
                 <div id="topic-news-list" class="news-list"></div>
             </div>
             <div id="topic-empty" class="empty-state hidden">
@@ -163,9 +191,17 @@
                     <span><label>成交额</label><b id="sdh-amount">--</b></span>
                     <span><label>换手率</label><b id="sdh-turnover">--</b></span>
                     <span><label>振幅</label><b id="sdh-amplitude">--</b></span>
+                    <span><label>总市值</label><b id="sdh-market-cap">--</b></span>
+                    <span><label>动态市盈率</label><b id="sdh-pe">--</b></span>
                 </div>
+                <div id="stock-quote-status" class="panel-footnote" aria-live="polite"></div>
             </div>
 
+            <section id="stock-commentary" class="stock-commentary surface hidden" aria-live="polite">
+                <div class="section-heading"><h3><svg class="icon"><use href="#i-spark"/></svg> <span id="commentary-title">个股短评</span></h3><span id="commentary-mode" class="small-badge">分析中</span></div>
+                <div id="commentary-body" class="commentary-body">正在分析行情与近期走势…</div>
+                <div class="commentary-footer"><span id="commentary-meta"></span><span>仅供研究参考</span></div>
+            </section>
             <!-- 图表周期切换 -->
             <div id="chart-period-tabs" class="chart-period-tabs hidden">
                 <button class="cptab active" data-period="intraday">分时</button>
@@ -182,15 +218,17 @@
 
             <!-- 图表区域 -->
             <div id="chart-wrap" class="chart-wrap hidden">
+                <div id="chart-status" class="panel-footnote" aria-live="polite"></div>
                 <div class="chart-main" id="chart-main"></div>
                 <div class="chart-indicator" id="chart-indicator"></div>
                 <div class="chart-indicator2" id="chart-indicator2"></div>
+                <div class="chart-indicator" id="chart-rsi"></div>
             </div>
 
             <!-- 空状态 -->
             <div id="stock-empty" class="empty-state">
-                <div class="empty-icon">📊</div>
-                <p>搜索股票查看详情：</p>
+                <div class="empty-icon"><svg class="icon"><use href="#i-chart"/></svg></div>
+                <h2>从一家公司开始研究</h2><p>搜索股票代码或名称，查看行情、走势与短评。</p>
                 <div class="search-box" style="max-width:400px;margin:16px auto;">
                     <input type="text" id="stock-detail-search" class="search-input"
                            placeholder="输入股票代码或名称" autocomplete="off">
@@ -211,9 +249,9 @@
 </div>
 
 <footer class="footer">
-    <p>数据源：新浪财经 · 东方财富 · DuckDuckGo ｜ 仅供参考，不构成投资建议</p>
+    <p><span class="footer-brand">股探 / STOCK EXPLORER</span><span>行情：新浪财经 · 东方财富　资讯：新浪财经 · 网络搜索</span><span>仅供参考，不构成投资建议</span></p>
 </footer>
 
-<script src="/static/js/main.js"></script>
+<script defer src="/static/js/main.js"></script>
 </body>
 </html>
