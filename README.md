@@ -1,29 +1,29 @@
-# 股探 · 市场观察工作台
+# StockExplorer · Market Observation Workbench
 
-本地 A 股市场工作台，包含指数、自选股、活跃股、分时与 K 线、热点发现和个股速读。
+A local workbench for China's A-share market, with indices, a watchlist, active stocks, intraday and K-line charts, hot-topic discovery, and per-stock quick briefs.
 
-## 启动
+## Getting started
 
 ```sh
 python3 -m pip install -r requirements.txt
 python3 app.py
 ```
 
-浏览器打开 http://localhost:8080。服务仅监听本机。
+Then open http://localhost:8080 in your browser. The service listens on localhost only.
 
-## 自动热门话题
+## Automatic hot topics
 
-服务运行期间，每 5 分钟在后台抓取东方财富概念板块与新浪财经滚动资讯。话题按板块涨幅、成交额和资讯提及排序，排除部分指数成分、资金分类和昨日表现标签。榜单用于发现活跃板块，不代表全网讨论热度。
+While the service is running, it fetches Eastmoney concept sectors and Sina Finance rolling news in the background every 5 minutes. Topics are ranked by sector gain, turnover, and news mentions, excluding some index-membership, money-flow, and prior-day-performance labels. The ranking is meant for discovering active sectors; it does not represent discussion heat across the whole web.
 
-页面展示来源、抓取时间及板块涨跌幅；标题链接到原文。成功结果缓存在 `.cache/hot-news.json`，上游失败时保留旧数据并标注缓存。停止服务后不会继续抓取。
+The page shows the source, fetch time, and sector gains/losses for each item, and titles link to the original articles. Successful results are cached in `.cache/hot-news.json`; if an upstream source fails, the previous data is kept and marked as cached. Fetching stops when the service stops.
 
-行情时段按北京时间显示，仅按周一至周五及交易时段判断，不包含法定节假日日历。指数和个股行情标明实际数据时间。
+Market hours are shown in Beijing time and are judged by weekday and trading session only; public holidays are not taken into account. Index and stock quotes are labelled with their actual data time.
 
-## 个股速读和可选 AI
+## Per-stock quick briefs and optional AI
 
-每次点开个股都会自动生成行情速读：价格表现、5/20 日均线、最近日线量能与当日价格区间。缺少数据时明确说明；只比较不晚于行情日期的 K 线。速读缓存 5 分钟。
+Opening a stock automatically generates a market brief: price performance, 5/20-day moving averages, recent daily volume, and the day's price range. Missing data is stated explicitly, and only K-lines dated no later than the quote date are compared. Briefs are cached for 5 minutes.
 
-默认使用规则生成，并明确标为“行情速读”。如需真实 AI 短评，复制 `.env.example` 为 `.env`，在本地填入 OpenAI 兼容服务的密钥、接口根地址（通常以 `/v1` 结尾）和模型名，再通过环境变量启动：
+By default, briefs are rule-generated and clearly labelled "Market brief". For a real AI commentary, copy `.env.example` to `.env`, fill in the key, API base URL (usually ending in `/v1`), and model name of an OpenAI-compatible service locally, then start the app through environment variables:
 
 ```sh
 set -a
@@ -32,17 +32,17 @@ set +a
 python3 app.py
 ```
 
-只有密钥和模型名同时配置才调用 AI，成功后显示“AI 短评”及模型名。模型服务将收到该股票的公开行情和近期 K 线，不发送自选股列表。服务失败自动回退为行情速读。密钥不进入浏览器，不应提交到版本控制。
+The AI is called only when both a key and a model name are configured; a successful result is labelled "AI commentary" together with the model name. The model service receives the stock's public quotes and recent K-lines; your watchlist is never sent. If the service fails, the app falls back to the rule-generated brief automatically. Keys never reach the browser and must not be committed to version control.
 
-所有内容仅供研究参考，不构成投资建议。
+All content is for research reference only and does not constitute investment advice.
 
-## 行情与样本来源
+## Market data and constituent sources
 
-- 指数样本使用中证指数或国证指数的公开样本文件；深市样本下载失败时尝试新浪最新成分页，部分名单会明确标注。成分股面板显示样本日期、来源和展示数量，支持按涨跌幅、总市值排序。
-- 话题搜索分页读取东方财富概念目录，目录不完整时补充公开板块目录；结果只显示沪深 A 股。东方财富资讯返回异常时，尝试新浪快讯或网页搜索，界面标注备用来源。
-- 分时优先使用东方财富分时数据，失败时使用其分钟 K 线。日、周、月 K 线为新浪不复权数据，成交量与详情、分时统一为手。详情页估值与换手率缺失时显示“—”。
+- Index constituents use the public sample files of the CSI and CNI indices. If a Shenzhen sample download fails, the app falls back to Sina's latest constituent pages, and such lists are labelled accordingly. The constituents panel shows the sample date, source, and number of stocks displayed, and supports sorting by price change and total market capitalisation.
+- Topic search pages through the Eastmoney concept catalogue, supplemented by a public sector catalogue when the catalogue is incomplete; results show Shanghai and Shenzhen A-shares only. If Eastmoney news returns errors, the app tries Sina bulletins or web search, and the interface labels the fallback source.
+- Intraday data prefers Eastmoney intraday data, falling back to its minute K-lines. Daily, weekly, and monthly K-lines are unadjusted Sina data, and volume is expressed in lots （手） consistently across the detail page and intraday views. Missing valuation or turnover figures on the detail page are shown as "—".
 
-## 验证
+## Verification
 
 ```sh
 python3 -m unittest discover -s tests -v
