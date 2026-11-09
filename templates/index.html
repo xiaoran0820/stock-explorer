@@ -27,6 +27,7 @@
         <nav class="main-tabs" aria-label="主要导航">
             <button class="mtab active" data-view="market">市场概览</button>
             <button class="mtab" data-view="discover">热点发现</button>
+            <button class="mtab" data-view="picks">回测选股</button>
             <button class="mtab" data-view="stock-detail" id="tab-stock-detail">个股研究</button>
         </nav>
         <div class="global-search search-box">
@@ -41,6 +42,7 @@
         </div>
     </div>
 </header>
+<div id="action-feedback" class="action-feedback" role="status"></div>
 <!-- ═══════════ 自选股横向条 ═══════════ -->
 <div id="wl-strip" class="wl-strip">
     <div class="wl-strip-header">
@@ -48,10 +50,10 @@
         <div class="wl-strip-search-wrapper">
             <input type="text" id="wl-strip-add-input" class="wl-strip-search" aria-label="添加自选股票"
                    placeholder="添加代码/名称..." autocomplete="off">
-            <div id="wl-strip-suggestions" class="wl-strip-suggestions"></div>
+            <div id="wl-strip-suggestions" class="suggestions wl-strip-suggestions"></div>
         </div>
         <span id="wl-strip-count" class="wl-strip-count">0</span>
-        <button class="text-btn" id="btn-clear-watchlist-strip">清空</button>
+        <button class="text-btn" id="btn-clear-watchlist-strip" disabled>清空</button>
     </div>
     <div id="wl-strip-items" class="wl-strip-items">
         <span class="wl-strip-empty">添加第一只自选股，关注它的每一次变化</span>
@@ -93,7 +95,7 @@
             <div id="constituents-panel" class="constituents-panel hidden">
                 <div class="panel-header">
                     <h3 id="constituents-title">成分股</h3>
-                    <button class="close-btn" id="btn-close-constituents">✕</button>
+                    <button class="close-btn" id="btn-close-constituents" aria-label="关闭成分股">✕</button>
                 </div>
                 <p id="constituents-meta" class="panel-footnote" aria-live="polite"></p>
                 <div class="stock-table-wrap">
@@ -131,6 +133,7 @@
                        autocomplete="off">
                 <button id="topic-search-btn" class="search-btn">探索话题 ↗</button>
             </div>
+            <p id="topic-action-status" class="research-status" role="status"></p>
 
             <!-- 默认推荐内容 -->
             <div id="discover-default" class="discover-default">
@@ -148,7 +151,10 @@
             <div id="topic-source-status" class="panel-footnote hidden" aria-live="polite"></div>
             <div id="topic-concepts" class="topic-concepts hidden"></div>
             <div id="topic-stocks-section" class="topic-section hidden">
-                <h3 class="section-title">相关股票 <span id="topic-stocks-count"></span></h3>
+                <div class="section-heading topic-stocks-heading">
+                    <h3 class="section-title">相关股票 <span id="topic-stocks-count"></span></h3>
+                    <button class="research-chip" type="button" id="btn-topic-backtest">对这些股票回测选股 →</button>
+                </div>
                 <div class="stock-table-wrap">
                     <table class="stock-table">
                         <thead><tr><th>代码</th><th>名称</th><th>最新价</th><th>涨跌幅</th><th>匹配原因</th><th>相关度</th></tr></thead>
@@ -168,6 +174,70 @@
             <div id="topic-loading" class="loading hidden"><div class="spinner"></div><p>正在匹配...</p></div>
         </div>
 
+        <!-- ═══════════ 回测选股视图 ═══════════ -->
+        <div id="view-picks" class="view">
+            <div class="view-heading"><span class="eyebrow">BACKTEST PICKS</span><h2>回测选股<span class="heading-dot">.</span></h2><p>用历史行情检验买卖规则，从热点话题里找出回测表现好、现在规则仍然看多的股票。</p></div>
+            <form id="picks-form" class="search-box topic-search-box">
+                <input type="text" id="picks-topic-input" class="search-input" aria-label="回测话题"
+                       placeholder="输入话题，如：固态电池；留空则使用当前热点话题" autocomplete="off">
+                <button id="picks-submit" class="search-btn picks-submit" type="submit" aria-controls="picks-results">
+                    <span class="picks-submit-spinner" aria-hidden="true"></span>
+                    <span id="picks-submit-label">开始回测</span>
+                </button>
+            </form>
+            <div id="picks-status" class="research-status" role="status"></div>
+            <div class="picks-controls">
+                <div class="research-presets" role="group" aria-label="买卖规则">
+                    <span class="picks-label">规则</span>
+                    <button class="research-chip" type="button" data-picks-strategy="ma_cross" aria-pressed="true">双均线</button>
+                    <button class="research-chip" type="button" data-picks-strategy="momentum" aria-pressed="false">动量趋势</button>
+                </div>
+                <div class="research-presets" role="group" aria-label="回测区间">
+                    <span class="picks-label">区间</span>
+                    <button class="research-chip" type="button" data-picks-window="half" aria-pressed="false">近半年</button>
+                    <button class="research-chip" type="button" data-picks-window="year" aria-pressed="true">近一年</button>
+                    <button class="research-chip" type="button" data-picks-window="two_years" aria-pressed="false">近两年</button>
+                </div>
+                <div class="research-presets">
+                    <button class="research-chip" type="button" id="picks-picked-only" aria-pressed="false">只看入选</button>
+                    <button class="research-chip" type="button" id="picks-use-hot">改用当前热点</button>
+                </div>
+            </div>
+            <p id="picks-rule" class="research-help"></p>
+            <section id="holdings-panel" class="surface holdings-panel" aria-labelledby="holdings-title">
+                <div class="section-heading">
+                    <div><span class="eyebrow">MY HOLDINGS</span><h3 id="holdings-title">我的持仓</h3></div>
+                    <span id="holdings-count" class="small-badge">读取中</span>
+                </div>
+                <p class="research-help">记下自己买入的股票，按上面选的规则给出建议：已持有的显示「继续持有」或「建议卖出」，没持有的股票在下方排名里显示「建议买入」或「观望」。</p>
+                <form id="holding-form" class="holding-form" autocomplete="off">
+                    <label class="holding-stock">股票
+                        <input id="holding-stock" type="text" placeholder="代码或名称，如 600519 或 茅台" required>
+                        <div id="holding-suggestions" class="suggestions"></div>
+                    </label>
+                    <label>买入日期<input id="holding-date" type="date" min="1990-01-01" required></label>
+                    <label>买入价（元，可不填）<input id="holding-price" type="number" min="0" step="0.001" inputmode="decimal" placeholder="不填按当天收盘价"></label>
+                    <label>股数（可不填）<input id="holding-shares" type="number" min="1" step="1" inputmode="numeric" placeholder="如 100"></label>
+                    <button class="search-btn" type="submit">记录买入</button>
+                </form>
+                <div id="holding-status" class="research-status" role="status"></div>
+                <div id="holdings-list"></div>
+                <p class="panel-footnote">记录只保存在这台电脑的 data/holdings.json，卖出后删除对应记录即可。盈亏按现价和买入价计算，不含分红和手续费。建议来自规则信号，仅供参考，不构成投资建议。</p>
+            </section>
+            <div id="picks-loading" class="loading hidden"><div class="spinner"></div><p>正在获取历史行情并回测，约需 10–30 秒…</p></div>
+            <section id="picks-results" class="hidden" aria-label="回测结果" tabindex="-1">
+                <div id="picks-topics" class="topic-concepts"></div>
+                <p id="picks-summary" class="picks-summary"></p>
+                <div class="stock-table-wrap">
+                    <table class="stock-table picks-table">
+                        <thead><tr><th>排名</th><th>股票</th><th>所属话题</th><th>策略收益</th><th>持有不动</th><th>超额收益</th><th>最大回撤</th><th>交易次数 · 胜率</th><th>操作建议</th></tr></thead>
+                        <tbody id="picks-body"></tbody>
+                    </table>
+                </div>
+                <p id="picks-footnote" class="panel-footnote"></p>
+            </section>
+        </div>
+
         <!-- ═══════════ 个股详情视图 ═══════════ -->
         <div id="view-stock-detail" class="view">
 
@@ -177,6 +247,7 @@
                     <h2 id="sdh-name">--</h2>
                     <span id="sdh-code" class="sdh-code">--</span>
                     <button class="watchlist-star" id="btn-watchlist-star" title="添加/移除自选">☆</button>
+                    <button class="research-jump" id="btn-open-research" type="button">公司研究 ↓</button>
                 </div>
                 <div class="sdh-right">
                     <span id="sdh-price" class="sdh-price">--</span>
@@ -225,13 +296,52 @@
                 <div class="chart-indicator" id="chart-rsi"></div>
             </div>
 
+            <section id="stock-research" class="surface stock-research hidden" aria-labelledby="stock-research-title" tabindex="-1">
+                <div class="section-heading research-heading">
+                    <div><span class="eyebrow">COMPANY RESEARCH</span><h3 id="stock-research-title">公司研究</h3></div>
+                    <span class="small-badge">公开资料</span>
+                </div>
+                <form id="research-form" class="research-form">
+                    <div class="research-presets" aria-label="历史新闻日期快捷选项">
+                        <button class="research-chip" type="button" data-research-days="30" aria-pressed="false">近 30 天</button>
+                        <button class="research-chip" type="button" data-research-days="90" aria-pressed="true">近 90 天</button>
+                        <button class="research-chip" type="button" data-research-days="365" aria-pressed="false">近一年</button>
+                    </div>
+                    <div class="research-date-fields">
+                        <label>开始日期<input id="research-start" type="date" min="1990-01-01" required></label>
+                        <label>截止日期<input id="research-end" type="date" min="1990-01-01" required></label>
+                        <button class="search-btn" type="submit">查询</button>
+                    </div>
+                </form>
+                <p class="research-help">日期范围筛选新闻与公告；经营数据仅采用截止日前已披露、可取得的财报。</p>
+                <div id="research-status" role="status" class="research-status"></div>
+                <div id="research-results" class="hidden">
+                    <div id="research-company" class="research-company"></div>
+                    <div class="research-block" id="research-financial"></div>
+                    <div class="research-block" id="research-insights"></div>
+                    <div class="research-block">
+                        <div class="section-heading research-timeline-heading">
+                            <h4>历史新闻与公告</h4>
+                            <div class="research-presets" aria-label="资料类型">
+                                <button class="research-chip" type="button" data-research-kind="all" aria-pressed="true">全部</button>
+                                <button class="research-chip" type="button" data-research-kind="media" aria-pressed="false">媒体报道</button>
+                                <button class="research-chip" type="button" data-research-kind="disclosure" aria-pressed="false">公司公告</button>
+                            </div>
+                        </div>
+                        <p id="research-coverage" class="research-help"></p>
+                        <div id="research-timeline" class="research-timeline"></div>
+                        <button class="research-chip research-more hidden" id="research-more" type="button">显示更多</button>
+                    </div>
+                </div>
+            </section>
+
             <!-- 空状态 -->
             <div id="stock-empty" class="empty-state">
                 <div class="empty-icon"><svg class="icon"><use href="#i-chart"/></svg></div>
                 <h2>从一家公司开始研究</h2><p>搜索股票代码或名称，查看行情、走势与短评。</p>
-                <div class="search-box" style="max-width:400px;margin:16px auto;">
+                <div class="search-box stock-empty-search">
                     <input type="text" id="stock-detail-search" class="search-input"
-                           placeholder="输入股票代码或名称" autocomplete="off">
+                           aria-label="搜索个股" placeholder="输入股票代码或名称" autocomplete="off">
                     <div id="stock-detail-suggestions" class="suggestions"></div>
                 </div>
             </div>
