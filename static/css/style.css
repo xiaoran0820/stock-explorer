@@ -563,7 +563,22 @@ a:hover {color:var(--blue)}
 }
 .sort-button {background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:0}
 .sort-button:hover {color:var(--blue)}
-#chart-status {border-top:0;margin:0;padding:0 8px 6px}
+#chart-status,#kline-gesture-hint {border-top:0;margin:0;padding:0 8px 6px}
+#chart-scroll.kline-scroll {
+    position:relative;
+    overflow-x:auto;
+    overflow-y:hidden;
+    overscroll-behavior-x:contain;
+    scroll-behavior:auto;
+    scrollbar-width:none;
+}
+#chart-scroll.kline-scroll::-webkit-scrollbar {display:none}
+#chart-scroll.kline-scroll .chart-track {width:var(--kline-scroll-width,100%)}
+#chart-scroll.kline-scroll .chart-viewport {
+    position:sticky;
+    left:0;
+    width:var(--kline-view-width,100%);
+}
 #constituents-meta {border-top:0;margin:0 0 12px;padding:0}
 
 /* Company research and source timeline */
@@ -601,6 +616,23 @@ a:hover {color:var(--blue)}
 .research-event-meta {display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin:0 0 4px}
 .research-event a {font-size:12px;overflow-wrap:anywhere}
 .research-more {margin-top:12px}
+.steady-panel {margin:16px 0 20px;min-width:0}
+.steady-panel h3 {margin:4px 0 0}
+.steady-pool-details {font-size:12px;color:var(--tx2)}
+.steady-pool-details summary {cursor:pointer;color:var(--blue);padding:6px 0}
+.steady-pool-details .stock-table-wrap {margin-top:8px}
+.steady-stock-link {font:inherit;color:var(--blue);background:none;border:0;cursor:pointer;padding:5px 0;text-align:left}
+.steady-stock-link:hover {text-decoration:underline}
+.steady-stock-link small {display:inline-block;margin-left:6px;color:var(--tx3)}
+.steady-section + .steady-section {border-top:1px solid var(--border);margin-top:14px;padding-top:12px}
+.steady-section h4 {font-size:13px;margin:0}
+.steady-checks {display:flex;flex-wrap:wrap;gap:6px 12px;list-style:none;margin:8px 0;padding:0;font-size:11px;color:var(--tx3)}
+.steady-checks strong {color:var(--tx2);font-weight:600}
+.steady-plan {margin:10px 0 0;border-left:2px solid var(--blue);padding:0 0 0 10px;font-size:12px;color:var(--tx2);line-height:1.65}
+.steady-plan p {margin:4px 0}
+@media(max-width:520px) {
+ .steady-panel .research-metrics {grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 @media (max-width:720px) {
  .stock-research {scroll-margin-top:128px}
  .research-form {padding:10px}
