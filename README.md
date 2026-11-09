@@ -58,6 +58,19 @@ The "Backtest stock picking" page tests trading rules on historical prices, then
 
 Historical backtests do not represent future performance and are for research reference only.
 
+## Steady strategy: dividend low-volatility pool
+
+The backtest page also shows a monthly dividend low-volatility candidate pool. Opening a pool stock shows why it was selected, each condition of the 55-day breakout rule, and — when the setup holds — the entry open range, a reference stop and a 1R target. Analysis uses closed, forward-adjusted daily bars; when the feed is unavailable the page labels the local archive date instead. An entry plan is valid only before the open of the first trading day after the signal day and is marked expired after that open (weekdays only; there is no holiday calendar, so plans may be marked expired early across public holidays).
+
+The monthly ranking is built from local price data and implemented cash dividends. Dividend yield is computed per share held on the ranking day: cash paid earlier is restated for any later bonus-share issues (for example, cash paid before a 10-for-1 bonus issue counts as one eleventh per current share). With the market archive and dividend records in place under `.cache/market-data`, run `python3 build_steady_snapshot.py` to generate a new pool snapshot; the site picks it up automatically and marks a stale pool as historical. Rebuilding the snapshot requires NumPy.
+
+Running `python3 market_pool_backtest.py` replays the rule historically across the full market (also requires NumPy): delisted stocks exit at zero recovery, Beijing Stock Exchange code transfers are reconciled, and three pools are compared — the whole market, the dividend low-volatility pool, and a news-driven hot-topic pool. Every pool also reports `buy_and_hold`: the same pool held at equal weight with no entry or exit rules, rebalanced at the next open when the pool changes, with identical fees and slippage. The trading rule has to beat that baseline to be worth anything.
+
+Two standalone research scripts use the same saved daily bars and trading costs:
+
+- `brooks_backtest.py` — a daily-bar Brooks H2 pullback experiment: swing points confirmed two bars later, second-entry pullbacks after a followed-through breakout, and a paired comparison of structural-target exits versus trailing stops over the same trades, with sub-period and slippage runs.
+- `trend_pullback_backtest.py` — a trend-continuation replay with fixed, partial and trailing exits; its breakout setup is the rule the steady strategy verifies live.
+
 ## My holdings
 
 "My holdings", above the backtest page, records stocks you bought yourself:
