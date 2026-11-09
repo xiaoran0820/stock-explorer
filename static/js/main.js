@@ -21,6 +21,14 @@ async function requestAPI(url, options = {}) {
 function dataState(message, action) {
     return `<div class="data-state">${escapeHTML(message)}${action ? `<button type="button" data-retry="${action}">重新连接</button>` : ''}</div>`;
 }
+let feedbackTimer;
+function showActionFeedback(message) {
+    const status = $('#action-feedback');
+    clearTimeout(feedbackTimer);
+    status.textContent = message;
+    feedbackTimer = setTimeout(() => { status.textContent = ''; }, 4000);
+}
+
 function makeKeyboardClickable(container, selector) {
     container.querySelectorAll(selector).forEach(item => {
         item.tabIndex = 0;
@@ -87,6 +95,9 @@ async function handleHash() {
     switch (view) {
     case 'discover':
         switchToDiscover(param1 || null);
+        break;
+    case 'picks':
+        switchToPicks(param1 || null);
         break;
     case 'stock':
         if (param1 && /^\d{6}$/.test(param1)) {
@@ -270,7 +281,12 @@ async function loadIndexQuotes() {
         const quoteTime = indices.map(i => i.quote_time || '').sort().at(-1);
         $('#index-update').textContent = indices.length ? `行情 ${quoteTime || '时间暂不可用'} · 北京时间` : '行情源暂不可用';
         updateMarketTime();
-    } catch(e) { $('#index-cards').innerHTML = dataState('行情连接失败，请稍后重试', 'indices'); $('#index-update').textContent = '连接中断'; }
+        return Boolean(indices.length);
+    } catch {
+        $('#index-cards').innerHTML = dataState('行情连接失败，请稍后重试', 'indices');
+        $('#index-update').textContent = '连接中断';
+        return false;
+    }
 }
 
 function renderBottomStrip(indices) {
@@ -297,10 +313,9 @@ function renderBottomStrip(indices) {
         mini.addEventListener('click', () => {
             const code = mini.dataset.code;
             const card = $(`.idx-card[data-code="${code}"]`);
-            if (card) {
-                card.click();
-                card.scrollIntoView({behavior:'smooth',block:'center'});
-            }
+            switchToMarket();
+            if (card) card.click();
+            else showActionFeedback('该指数的成分股入口暂不可用');
         });
     });
 }
@@ -325,6 +340,7 @@ function renderIndexCards(indices) {
             container.querySelectorAll('.idx-card').forEach(c => c.classList.toggle('selected', c === card));
             state.selectedIndex = {code, name};
             loadConstituents(code, name);
+            $('#constituents-panel').scrollIntoView({block:'start'});
         });
     });
 }
@@ -418,7 +434,7 @@ async function loadPopularStocks() {
         if (!stocks.length) {
             container.innerHTML = dataState('活跃股行情暂不可用', 'popular');
             if (countEl) countEl.textContent = '0';
-            return;
+            return false;
         }
 
         container.innerHTML = stocks.map((s, index) => {
@@ -445,9 +461,12 @@ async function loadPopularStocks() {
                 selectStock(code, mkt, name);
             });
         });
+        return true;
     } catch(e) {
         container.innerHTML = dataState('活跃股加载失败', 'popular');
+        if (countEl) countEl.textContent = '0';
         console.error('Popular stocks error:', e);
+        return false;
     }
 }
 
@@ -462,72 +481,68 @@ function loadWatchlist() {
     } catch(e) { state.watchlist = []; }
 }
 
-function saveWatchlist() {
-    localStorage.setItem('watchlist', JSON.stringify(state.watchlist));
-}
-
 function isInWatchlist(code) {
     return state.watchlist.some(w => w.code === code);
 }
 
-function addToWatchlist(code, name) {
-    if (!/^\d{6}$/.test(code) || isInWatchlist(code) || state.watchlist.length >= 30) return;
-    state.watchlist.push({code, name, addedAt: Date.now()});
-    saveWatchlist();
-    refreshWatchlistQuotes();
+function updateWatchlist(next, message) {
+    try {
+        localStorage.setItem('watchlist', JSON.stringify(next));
+    } catch {
+        showActionFeedback('自选保存失败，请检查浏览器的存储设置');
+        return;
+    }
+    state.watchlist = next;
+    renderWatchlist();
     updateStarButton();
+    showActionFeedback(message);
+    refreshWatchlistQuotes();
+}
+
+function addToWatchlist(code, name) {
+    if (!/^\d{6}$/.test(code)) return;
+    if (isInWatchlist(code)) {
+        showActionFeedback(`${name}已在自选中`);
+        return;
+    }
+    if (state.watchlist.length >= 30) {
+        showActionFeedback('自选已满 30 只，移除一只后再添加');
+        return;
+    }
+    updateWatchlist([...state.watchlist, {code, name, addedAt: Date.now()}], `已添加 ${name} 到自选`);
 }
 
 function removeFromWatchlist(code) {
-    state.watchlist = state.watchlist.filter(w => w.code !== code);
-    saveWatchlist();
-    refreshWatchlistQuotes();
-    if (state.currentStock && state.currentStock.code === code) {
-        updateStarButton();
-    }
+    const stock = state.watchlist.find(item => item.code === code);
+    if (stock) updateWatchlist(state.watchlist.filter(w => w.code !== code), `已移除自选 ${stock.name}`);
 }
 
-async function refreshWatchlistQuotes() {
+let watchlistQuotes = new Map();
+let watchlistRequest = 0;
+
+function renderWatchlist() {
     const container = $('#wl-strip-items');
-    const countEl = $('#wl-strip-count');
+    $('#wl-strip-count').textContent = state.watchlist.length;
+    $('#btn-clear-watchlist-strip').disabled = !state.watchlist.length;
 
     if (!state.watchlist.length) {
-        if (container) container.innerHTML = '<span class="wl-strip-empty">添加第一只自选股，关注它的每一次变化</span>';
-        if (countEl) countEl.textContent = '0';
+        container.innerHTML = '<span class="wl-strip-empty">添加第一只自选股，关注它的每一次变化</span>';
         return;
     }
 
-    const codes = state.watchlist.map(w => w.code).join(',');
-    let stocks = [];
-    try {
-        const r = await requestAPI(`/api/stocks/batch?codes=${encodeURIComponent(codes)}`);
-        stocks = await r.json();
-    } catch(e) { console.error('Watchlist quotes error:', e); }
-
-    const lookup = {};
-    stocks.forEach(s => { lookup[s.code] = s; });
-
-    if (!container) return;
     container.innerHTML = state.watchlist.map(w => {
-        const s = lookup[w.code];
-        if (!s) return `<div class="wl-strip-mini" data-code="${w.code}" data-market="${stockMarket(w.code)}" data-name="${escapeHTML(w.name)}">
+        const s = watchlistQuotes.get(w.code);
+        const name = escapeHTML(s?.name || w.name || w.code);
+        const cls = s?.change_pct > 0 ? 'wl-up' : s?.change_pct < 0 ? 'wl-down' : '';
+        const activeCls = state.currentStock?.code === w.code ? 'active' : '';
+        return `<div class="wl-strip-mini ${activeCls}" data-code="${w.code}" data-market="${stockMarket(w.code)}" data-name="${name}">
             <span class="wls-code">${w.code}</span>
-            <span class="wls-name">${escapeHTML(w.name)}</span>
-            <span class="wls-remove" data-code="${w.code}">✕</span></div>`;
-
-        const cls = s.change_pct >= 0 ? 'wl-up' : s.change_pct < 0 ? 'wl-down' : '';
-        const activeCls = state.currentStock && state.currentStock.code === w.code ? 'active' : '';
-        return `<div class="wl-strip-mini ${activeCls}" data-code="${w.code}" data-market="${stockMarket(w.code)}" data-name="${escapeHTML(s.name)}">
-            <span class="wls-code">${w.code}</span>
-            <span class="wls-name">${escapeHTML(s.name)}</span>
-            <span class="wls-price ${cls}">${s.price>0?s.price.toFixed(2):'--'}</span>
-            <span class="wls-change ${cls}">${formatPercent(s.change_pct)}</span>
-            <span class="wls-remove" data-code="${w.code}">✕</span></div>`;
+            <span class="wls-name">${name}</span>
+            <span class="wls-price ${cls}">${s?.price > 0 ? s.price.toFixed(2) : '—'}</span>
+            ${s ? `<span class="wls-change ${cls}">${formatPercent(s.change_pct)}</span>` : ''}
+            <button type="button" class="wls-remove" data-code="${w.code}" aria-label="从自选移除 ${name}">✕</button></div>`;
     }).join('');
 
-    if (countEl) countEl.textContent = state.watchlist.length;
-
-    // Click handlers
     container.querySelectorAll('.wl-strip-mini').forEach(item => {
         item.addEventListener('click', (e) => {
             if (e.target.classList.contains('wls-remove')) return;
@@ -545,12 +560,32 @@ async function refreshWatchlistQuotes() {
     });
 }
 
+async function refreshWatchlistQuotes() {
+    const id = ++watchlistRequest;
+    const codes = state.watchlist.map(w => w.code);
+    if (!codes.length) return true;
+    try {
+        const response = await requestAPI(`/api/stocks/batch?codes=${encodeURIComponent(codes.join(','))}`);
+        const stocks = await response.json();
+        if (id === watchlistRequest) {
+            watchlistQuotes = new Map(stocks.map(stock => [stock.code, stock]));
+            renderWatchlist();
+        }
+        return codes.every(code => stocks.some(stock => stock.code === code && stock.price > 0));
+    } catch {
+        return false;
+    }
+}
+
 function updateStarButton() {
     const btn = $('#btn-watchlist-star');
     if (!btn) return;
     if (!state.currentStock) { btn.style.display = 'none'; return; }
     btn.style.display = '';
-    if (isInWatchlist(state.currentStock.code)) {
+    const starred = isInWatchlist(state.currentStock.code);
+    btn.setAttribute('aria-pressed', String(starred));
+    btn.setAttribute('aria-label', starred ? '移出自选' : '加入自选');
+    if (starred) {
         btn.textContent = '★'; btn.classList.add('starred');
     } else {
         btn.textContent = '☆'; btn.classList.remove('starred');
@@ -574,6 +609,7 @@ function updateWatchlistHighlight() {
 async function selectStock(code, market, name, restorePeriod) {
     // restorePeriod: null/'intraday' = 分时, 'daily'/'weekly'/'monthly' = K线
     if (!/^\d{6}$/.test(code)) return;
+    const openingStock = state.currentStock?.code !== code || !$('#view-stock-detail').classList.contains('active');
     const period = restorePeriod || 'intraday';
     setHash('stock', code, period === 'intraday' ? null : period);
     state.currentStock = {code, market, name};
@@ -623,7 +659,9 @@ async function selectStock(code, market, name, restorePeriod) {
     $('#sdh-code').textContent = `${market === 1 ? 'SH' : 'SZ'}${code}`;
     ['price','change','open','high','low','preclose','volume','amount','turnover','amplitude','market-cap','pe'].forEach(k => { $(`#sdh-${k}`).textContent = '--'; });
     $('#stock-quote-status').textContent = '正在获取行情…';
+    if (openingStock) header?.scrollIntoView({block:'start'});
     loadCommentary(code);
+    loadStockResearch(code);
     // Load chart based on period
     if (period === 'intraday') {
         await loadIntradayChart(code, market, name);
@@ -712,7 +750,10 @@ async function loadIntradayChart(code, market, name) {
     $('#chart-status').textContent = '正在加载分时…';
     $$('.ind-toggle').forEach(button => { button.disabled = true; });
     const chart = initChart('chart-main');
-    if (!chart) return;
+    if (!chart) {
+        $('#chart-status').textContent = '图表组件暂不可用';
+        return;
+    }
     chart.showLoading();
 
     try {
@@ -722,6 +763,7 @@ async function loadIntradayChart(code, market, name) {
         chart.hideLoading();
 
         if (!data.minutes || !data.minutes.length) {
+            $('#chart-status').innerHTML = dataState('暂未取得分时行情', 'chart');
             chart.setOption({
                 title: {text: '暂无分时数据', subtext: '当日非交易时段或无数据源', left: 'center', top: 'center',
                     textStyle: {color: chartText(), fontSize: 14},
@@ -798,7 +840,10 @@ async function loadKlineChart(code, market, period) {
     $$('.ind-toggle').forEach(button => { button.disabled = false; });
 
     const mainChart = initChart('chart-main');
-    if (!mainChart) return;
+    if (!mainChart) {
+        $('#chart-status').textContent = '图表组件暂不可用';
+        return;
+    }
     mainChart.showLoading();
 
     try {
@@ -807,6 +852,7 @@ async function loadKlineChart(code, market, period) {
         if (mainChart.isDisposed() || state.currentStock?.code !== code || state.currentPeriod !== period) return;
         mainChart.hideLoading();
         if (!result.data || !result.data.length) {
+            $('#chart-status').innerHTML = dataState('暂未取得 K 线行情', 'chart');
             mainChart.setOption({title:{text:'暂无数据',left:'center',top:'center',textStyle:{color:chartText()}}}, true);
             return;
         }
@@ -997,11 +1043,15 @@ function renderTopics(container, topics) {
     container.querySelectorAll('[data-topic]').forEach(button => button.addEventListener('click', () => switchToDiscover(button.dataset.topic)));
 }
 async function loadHotNews(force = false) {
-    if (hotNewsPending) return;
+    if (hotNewsPending) return 'pending';
     hotNewsPending = true;
     clearTimeout(hotNewsTimer);
     const button = $('#btn-refresh-topics');
+    const note = $('#topics-update');
+    let refreshing = false;
     button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    if (force) note.textContent = '正在更新热门话题…';
     try {
         const r = await requestAPI(`/api/news/hot${force === true ? '?refresh=1' : ''}`);
         const data = await r.json();
@@ -1009,8 +1059,11 @@ async function loadHotNews(force = false) {
         const topics = data.topics || [];
         renderTopics($('#hot-topics'), topics);
         renderTopics($('#discover-hot-topics'), topics);
-        const status = data.refreshing ? '正在抓取…' : data.stale || data.topics_stale ? '上次缓存 · 正在重试' : '每 5 分钟更新';
-        $('#topics-update').textContent = `${data.sources?.topics || '市场热点'} · ${status}${data.topics_updated_at || data.updated_at ? ` · 抓取 ${displayTime(data.topics_updated_at || data.updated_at, true)}` : ''}`;
+        refreshing = Boolean(data.refreshing);
+        const cached = data.stale || data.last_attempt_at > data.fetched_at;
+        const status = refreshing ? '正在抓取…' : !topics.length ? '暂未取得热门话题' :
+            cached || data.topics_stale ? '显示上次缓存' : '每 5 分钟更新';
+        note.textContent = `${data.sources?.topics || '市场热点'} · ${status}${data.topics_updated_at || data.updated_at ? ` · 抓取 ${displayTime(data.topics_updated_at || data.updated_at, true)}` : ''}`;
         const news = data.news || [];
         if (news.length) {
             $('#hot-news').innerHTML = news.slice(0,8).map(n => `<article class="news-card">
@@ -1021,17 +1074,23 @@ async function loadHotNews(force = false) {
         } else {
             $('#hot-news').innerHTML = dataState(data.refreshing ? '正在抓取市场快讯…' : '资讯源暂不可用，稍后会自动重试', data.refreshing ? null : 'news');
         }
-        const note = $('.news-panel .panel-footnote');
-        if (note) note.textContent = `${data.news_stale || data.stale ? '显示上次缓存 · ' : ''}聚合公开财经资讯 · 点击标题阅读原文${data.news_updated_at ? ` · 抓取 ${displayTime(data.news_updated_at, true)}` : ''}`;
+        const newsNote = $('.news-panel .panel-footnote');
+        if (newsNote) newsNote.textContent = `${data.news_stale || cached ? '显示上次缓存 · ' : ''}聚合公开财经资讯 · 点击标题阅读原文${data.news_updated_at ? ` · 抓取 ${displayTime(data.news_updated_at, true)}` : ''}`;
         if (data.refreshing || data.status === 'unavailable') hotNewsTimer = setTimeout(loadHotNews, data.refreshing ? 2500 : 15000);
+        return refreshing ? 'pending' : Boolean(topics.length && news.length && !cached && !data.topics_stale && !data.news_stale);
     } catch(e) {
         if (!state.hotData) {
             $('#hot-news').innerHTML = dataState('资讯连接失败，请稍后重试', 'news');
             $('#hot-topics').innerHTML = dataState('热点连接失败，请稍后重试', 'news');
         }
-        $('#topics-update').textContent = '连接中断 · 将自动重试';
+        note.textContent = '连接中断 · 将自动重试';
         hotNewsTimer = setTimeout(loadHotNews, 15000);
-    } finally { hotNewsPending = false; button.disabled = false; }
+        return false;
+    } finally {
+        hotNewsPending = false;
+        button.disabled = refreshing;
+        button.setAttribute('aria-busy', String(refreshing));
+    }
 }
 
 async function loadCommentary(code) {
@@ -1055,6 +1114,188 @@ async function loadCommentary(code) {
         $('#commentary-body').innerHTML = dataState('速读获取失败，可重新尝试', 'commentary');
         $('#commentary-meta').textContent = '请检查行情源连接';
     }
+}
+
+const researchState = {request: 0, controller: null, data: null, kind: 'all', limit: 8};
+
+function researchDate(date) {
+    return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-');
+}
+
+function setResearchRange(days) {
+    const end = beijingTime();
+    const start = new Date(end.getFullYear(), end.getMonth(), end.getDate() - (days - 1));
+    const today = researchDate(end);
+    $('#research-end').max = today;
+    $('#research-start').max = today;
+    $('#research-end').value = today;
+    $('#research-start').value = researchDate(start);
+    $$('[data-research-days]').forEach(btn => btn.setAttribute('aria-pressed', String(Number(btn.dataset.researchDays) === days)));
+}
+
+function researchLink(url, label) {
+    return url ? `<a href="${safeURL(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(label)} ↗</a>` : '';
+}
+
+function researchMoney(value, currency) {
+    if (!Number.isFinite(value)) return '—';
+    if (currency === 'CNY') return `${(value / 1e8).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2})} 亿`;
+    return `${value.toLocaleString('zh-CN', {maximumFractionDigits:2})} ${escapeHTML(currency || '原币')}`;
+}
+
+function renderResearchFinancial(data) {
+    const f = data.financial;
+    const section = $('#research-financial');
+    if (!f) {
+        const msg = data.sources.financial === 'out_of_range' ? '可取得的财报中，没有在此截止日前发布的记录。' : '财务数据源暂不可用。';
+        section.innerHTML = `<h4>经营状况</h4>${dataState(msg, data.sources.financial === 'unavailable' ? 'research' : null)}`;
+        return;
+    }
+    const cashPerShare = f.operating_cash == null && f.cash_per_share != null;
+    const metrics = [
+        ['营业总收入', researchMoney(f.revenue, f.currency), f.revenue_yoy, '同比'],
+        ['归母净利润', researchMoney(f.net_profit, f.currency), f.profit_yoy, '同比'],
+        cashPerShare ? ['每股经营现金流', `${f.cash_per_share.toFixed(2)} ${escapeHTML(f.currency || '原币')}`, f.cash_per_share_yoy, '同比']
+            : ['经营活动现金流净额', researchMoney(f.operating_cash, f.currency), null, null],
+        ['资产负债率', Number.isFinite(f.debt_ratio) ? f.debt_ratio.toFixed(2) + '%' : '—', null, null],
+    ];
+    const rows = data.reports.map(report => `<tr><td>${escapeHTML(report.period)}</td><td>${escapeHTML(report.disclosed_on)}</td>
+        <td>${escapeHTML(report.available_on)}${report.updated_after_cutoff ? '（晚于截止日）' : ''}</td>
+        <td>${researchMoney(report.revenue, report.currency)}</td><td>${researchMoney(report.net_profit, report.currency)}</td>
+        <td>${researchMoney(report.operating_cash, report.currency)}</td></tr>`).join('');
+    section.innerHTML = `<div class="section-heading"><h4>经营状况</h4><span class="small-badge">${escapeHTML(f.period_name || f.period)}</span></div>
+        <p class="research-help">报告期 ${escapeHTML(f.period)} · 披露 ${escapeHTML(f.disclosed_on)} · 收入、利润与现金流为累计口径${f.currency === 'CNY' ? '，金额为人民币' : ''}</p>
+        ${f.updated_after_cutoff ? `<p class="research-help research-version">平台于 ${escapeHTML(f.available_on)} 更新该期数据。以下为可取得的版本，可能与截止日当天看到的数字不同。</p>` : ''}
+        <div class="research-metrics">${metrics.map(([label, value, change, sub]) => `<div class="research-metric"><span>${label}</span><strong>${value}</strong>
+            ${Number.isFinite(change) ? `<small class="${change > 0 ? 'st-change-up' : change < 0 ? 'st-change-down' : ''}">${sub} ${formatPercent(change)}</small>` : ''}</div>`).join('')}</div>
+        <div class="research-links">${researchLink(f.source_url, f.source)} ${researchLink(f.filing_url, '财报 PDF')}</div>
+        <details class="research-history"><summary>历期数据（${data.reports.length} 期）</summary><div class="stock-table-wrap"><table class="stock-table">
+            <thead><tr><th>报告期</th><th>披露日期</th><th>数据版本日期</th><th>营业总收入</th><th>归母净利润</th><th>经营现金流净额</th></tr></thead><tbody>${rows}</tbody>
+        </table></div></details>`;
+}
+
+function renderResearchTimeline() {
+    const data = researchState.data;
+    if (!data) return;
+    const {kind, limit} = researchState;
+    const records = data.timeline.filter(item => kind === 'all' || item.kind === kind);
+    $$('[data-research-kind]').forEach(btn => btn.setAttribute('aria-pressed', String(btn.dataset.researchKind === kind)));
+    const notes = [`${data.start} 至 ${data.end} · ${records.length} 条`];
+    const hasMedia = data.timeline.some(row => row.kind === 'media');
+    if (kind !== 'disclosure') {
+        if (data.sources.media === 'unavailable') notes.push(hasMedia ? '历史媒体索引暂不可用，已显示新浪近期报道' : '历史媒体索引暂不可用');
+        else notes.push('媒体报道按索引收录');
+        if (data.truncated.media) notes.push('媒体结果达到上限，可缩小日期范围');
+    }
+    if (kind !== 'media') {
+        if (data.sources.disclosures === 'unavailable') notes.push('巨潮资讯暂不可用');
+        else if (data.sources.disclosures === 'partial') notes.push('公告仅取得部分结果，可重新查询');
+        else if (data.truncated.disclosures) notes.push('最多收录 60 条公告，可缩小日期范围');
+    }
+    $('#research-coverage').textContent = notes.join(' · ');
+    const timeline = $('#research-timeline');
+    const missingSource = (kind === 'disclosure' && data.sources.disclosures === 'unavailable') ||
+        (kind === 'media' && data.sources.media === 'unavailable' && !hasMedia) ||
+        (kind === 'all' && (data.sources.media === 'unavailable' || data.sources.disclosures === 'unavailable'));
+    timeline.innerHTML = records.length ? records.slice(0, limit).map(item => `<article class="research-event">
+        <time datetime="${escapeHTML(item.date)}">${escapeHTML(item.date)}</time>
+        <div><div class="research-event-meta"><span class="small-badge">${item.kind === 'disclosure' ? '公告' : '媒体'}</span><span>${escapeHTML(item.category)}</span><span>${escapeHTML(item.source)}${item.via ? ' · ' + escapeHTML(item.via) : ''}</span></div>
+        ${researchLink(item.url, item.title)}</div></article>`).join('') : dataState(
+            missingSource ? '有来源暂未返回可用资料。' : '此日期范围没有收录到此类记录。',
+            missingSource ? 'research' : null);
+    $('#research-more').classList.toggle('hidden', records.length <= limit);
+}
+
+function renderResearch(data) {
+    const company = data.company;
+    $('#research-company').innerHTML = company
+        ? `<div class="section-heading"><h4>${escapeHTML(company.name)}</h4>${company.industry ? `<span class="small-badge">${escapeHTML(company.industry)}</span>` : ''}</div>
+           ${company.business ? `<p>${escapeHTML(company.business)}</p>` : ''}<div class="research-links">${researchLink(company.website, '公司官网')} ${researchLink(company.source_url, company.source)}</div>`
+        : `<h4>${escapeHTML(data.name)}</h4><p class="research-help">公司资料暂不可用。</p>`;
+    renderResearchFinancial(data);
+    $('#research-insights').innerHTML = `<div class="section-heading"><h4>经营与事件分析</h4><span class="small-badge">规则联读</span></div>
+        ${data.reports.some(report => report.updated_after_cutoff) ? '<p class="research-help">部分财务数据来自截止日后更新的平台版本，分析仅供回顾。</p>' : ''}
+        ${data.insights.length ? `<div class="research-insight-grid">${data.insights.map(insight => `<article class="research-insight">
+        <h5>${escapeHTML(insight.title)}</h5><p>${escapeHTML(insight.text)}</p>
+        <div class="research-links">${insight.refs.map(ref => researchLink(ref.url, ref.label)).join(' ')}</div></article>`).join('')}</div>`
+        : dataState('暂无足够的财报或公司事件材料可供分析。')}`;
+    renderResearchTimeline();
+}
+
+async function loadStockResearch(code) {
+    const panel = $('#stock-research');
+    panel.classList.remove('hidden');
+    const status = $('#research-status');
+    const start = $('#research-start').value, end = $('#research-end').value;
+    const id = ++researchState.request;
+    researchState.controller?.abort();
+    researchState.data = null;
+    researchState.kind = 'all';
+    researchState.limit = 8;
+    $('#research-results').classList.add('hidden');
+    panel.setAttribute('aria-busy', 'false');
+    if (!start || !end || start > end || end > $('#research-end').max) {
+        status.textContent = '请选择有效的起止日期，截止日期不能晚于今天。';
+        return;
+    }
+    if ((Date.parse(end) - Date.parse(start)) / 86400000 + 1 > 730) {
+        status.textContent = '单次最多查询 730 天，请缩小日期范围。';
+        return;
+    }
+    if (!/^(60|68|00|30)\d{4}$/.test(code)) {
+        status.textContent = '公司研究暂支持沪深 A 股。';
+        return;
+    }
+    const controller = new AbortController();
+    researchState.controller = controller;
+    const timeout = setTimeout(() => controller.abort(), 45000);
+    panel.setAttribute('aria-busy', 'true');
+    status.textContent = '正在查询公司资料、财报、新闻与公告…';
+    try {
+        const params = new URLSearchParams({start, end});
+        const response = await requestAPI(`/api/stock/${encodeURIComponent(code)}/research?${params}`, {signal: controller.signal});
+        const data = await response.json();
+        if (id !== researchState.request || state.currentStock?.code !== code) return;
+        researchState.data = data;
+        renderResearch(data);
+        status.textContent = '';
+        $('#research-results').classList.remove('hidden');
+    } catch {
+        if (id !== researchState.request || state.currentStock?.code !== code) return;
+        status.innerHTML = dataState('公司研究资料加载失败，请稍后重试。', 'research');
+    } finally {
+        clearTimeout(timeout);
+        if (id === researchState.request) panel.setAttribute('aria-busy', 'false');
+    }
+}
+
+function bindStockResearch() {
+    setResearchRange(90);
+    $('#btn-open-research').addEventListener('click', () => {
+        const panel = $('#stock-research');
+        panel.focus({preventScroll: true});
+        panel.scrollIntoView({block: 'start'});
+    });
+    $('#research-form').addEventListener('submit', event => {
+        event.preventDefault();
+        if (state.currentStock) loadStockResearch(state.currentStock.code);
+    });
+    $$('[data-research-days]').forEach(btn => btn.addEventListener('click', () => {
+        setResearchRange(Number(btn.dataset.researchDays));
+        if (state.currentStock) loadStockResearch(state.currentStock.code);
+    }));
+    ['#research-start','#research-end'].forEach(selector => $(selector).addEventListener('input', () => {
+        $$('[data-research-days]').forEach(btn => btn.setAttribute('aria-pressed', 'false'));
+    }));
+    $$('[data-research-kind]').forEach(btn => btn.addEventListener('click', () => {
+        researchState.kind = btn.dataset.researchKind;
+        researchState.limit = 8;
+        renderResearchTimeline();
+    }));
+    $('#research-more').addEventListener('click', () => {
+        researchState.limit += 8;
+        renderResearchTimeline();
+    });
 }
 
 function switchToDiscover(topic) {
@@ -1116,6 +1357,9 @@ async function loadDiscoverDefault() {
 
 function showDiscoverDefault() {
     topicRequest++;
+    pendingTopic = null;
+    setTopicLoading(false);
+    $('#topic-action-status').textContent = '';
     $('#topic-source-status').classList.add('hidden');
     const dd = $('#discover-default');
     if (dd) dd.classList.remove('hidden');
@@ -1127,16 +1371,33 @@ function showDiscoverDefault() {
 }
 
 let topicRequest = 0;
+let pendingTopic = null;
+
+function setTopicLoading(loading) {
+    const button = $('#topic-search-btn');
+    button.disabled = loading;
+    button.setAttribute('aria-busy', String(loading));
+    button.textContent = loading ? '匹配中' : '探索话题 ↗';
+}
+
 async function searchTopic() {
-    const requestId = ++topicRequest;
-    const query = $('#topic-search-input').value.trim();
+    const input = $('#topic-search-input');
+    const query = input.value.trim();
+    const actionStatus = $('#topic-action-status');
+    if (query === pendingTopic) return;
     if (!query) {
         setHash('discover');
         showDiscoverDefault();
+        actionStatus.textContent = '请输入话题，或点击下方的热门话题';
+        input.focus();
         if (!state.discoverLoaded) loadDiscoverDefault();
         return;
     }
 
+    const requestId = ++topicRequest;
+    pendingTopic = query;
+    setTopicLoading(true);
+    actionStatus.textContent = `正在匹配「${query}」…`;
     setHash('discover', query);
     // Hide default, show loading
     $('#topic-source-status').classList.add('hidden');
@@ -1214,13 +1475,370 @@ async function searchTopic() {
             $('#topic-empty').innerHTML = dataState('未找到相关结果，试试其他关键词');
             $('#topic-empty').classList.remove('hidden');
         }
+        actionStatus.textContent = hasResults ? '' : '未找到相关结果，试试其他关键词';
     } catch(e) {
         if (requestId !== topicRequest) return;
         $('#topic-loading').classList.add('hidden');
         $('#topic-empty').innerHTML = dataState('话题搜索暂不可用', 'topic');
         $('#topic-empty').classList.remove('hidden');
+        actionStatus.textContent = '话题搜索暂不可用，请重试';
         console.error('Topic error:', e);
+    } finally {
+        if (requestId === topicRequest) {
+            pendingTopic = null;
+            setTopicLoading(false);
+        }
     }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Backtest Picks — 回测选股
+   #picks        → 当前热点话题
+   #picks/TOPIC  → 指定话题
+   ═══════════════════════════════════════════════════════ */
+
+const picksState = {request: 0, data: null, strategy: 'ma_cross', window: 'year', pickedOnly: false, loaded: false};
+const ADVICE = {
+    keep: ['继续持有', 'pick-signal-hold'], sell: ['建议卖出', 'pick-signal-sell'],
+    buy: ['建议买入', 'pick-signal-buy'], watch: ['观望', 'pick-signal-flat'],
+};
+
+// 同一个规则信号，按你是否真的持有给出不同建议：
+// 持有 → 继续持有 / 建议卖出；没持有 → 建议买入 / 观望（没持有的股票不会显示「持有」）
+function adviceFor(state, held) {
+    if (!state) return null;
+    const long = state.signal === 'buy' || state.signal === 'hold';
+    const key = held ? (long ? 'keep' : 'sell') : (long ? 'buy' : 'watch');
+    let detail = '';
+    if (state.signal === 'buy') detail = `买入信号 ${state.as_of} 收盘`;
+    else if (state.signal === 'sell') detail = `卖出信号 ${state.as_of} 收盘`;
+    else if (state.signal === 'hold') detail = held ? `持有信号自 ${state.since}` : `上涨信号自 ${state.since} 起，不是新信号`;
+    else if (held) detail = `自 ${state.since} 起已转为空仓信号`;
+    const [label, cls] = ADVICE[key];
+    return {key, label, cls, detail};
+}
+
+function adviceHTML(advice) {
+    if (!advice) return '<span class="pick-signal pick-signal-flat">数据不足</span>';
+    return `<span class="pick-signal ${advice.cls}">${advice.label}</span>${advice.detail ? `<small>${escapeHTML(advice.detail)}</small>` : ''}`;
+}
+
+function pickPercent(value) {
+    return Number.isFinite(value) ? `${colorSign(value)}${(value * 100).toFixed(2)}%` : '—';
+}
+function pickChangeClass(value) {
+    return value > 0 ? 'st-change-up' : value < 0 ? 'st-change-down' : '';
+}
+
+function switchToPicks(topic, options) {
+    $$('.mtab').forEach(b => b.classList.toggle('active', b.dataset.view === 'picks'));
+    $$('.view').forEach(v => v.classList.remove('active'));
+    $('#view-picks').classList.add('active');
+    $('#picks-topic-input').value = topic || '';
+    loadHoldings();
+    loadPicks(options);
+}
+
+async function loadPicks({revealResults = false} = {}) {
+    const query = $('#picks-topic-input').value.trim();
+    const id = ++picksState.request;
+    const submit = $('#picks-submit');
+    const label = $('#picks-submit-label');
+    const results = $('#picks-results');
+    const status = $('#picks-status');
+    submit.disabled = revealResults;
+    label.textContent = revealResults ? '回测中' : '开始回测';
+    setHash('picks', query || null);
+    const params = new URLSearchParams({scope: query ? 'topic' : 'hot', window: picksState.window});
+    if (query) params.set('query', query);
+    picksState.data = null;
+    renderPicks();
+    results.classList.add('hidden');
+    $('#picks-loading').classList.remove('hidden');
+    status.textContent = query ? `正在回测与「${query}」相关的股票…` : '正在回测当前热点话题里的股票…';
+    try {
+        const response = await window.fetch(`/api/picks?${params}`, {signal: AbortSignal.timeout(90000)});
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+        if (id !== picksState.request) return;
+        picksState.data = data;
+        picksState.loaded = true;
+        status.textContent = '';
+        renderPicks();
+        results.classList.remove('hidden');
+    } catch (error) {
+        if (id !== picksState.request) return;
+        status.innerHTML = dataState(error.name === 'TimeoutError'
+            ? '回测超时，行情源响应较慢，请稍后重试' : error.message || '回测失败，请稍后重试', 'picks');
+    } finally {
+        if (id === picksState.request) {
+            $('#picks-loading').classList.add('hidden');
+            submit.disabled = false;
+            label.textContent = '开始回测';
+        }
+    }
+    if (revealResults && !results.classList.contains('hidden') && $('#view-picks').classList.contains('active')) {
+        results.focus({preventScroll: true});
+        const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        results.scrollIntoView({block: 'start', behavior: reducedMotion ? 'auto' : 'smooth'});
+    }
+}
+
+function renderPicks() {
+    const data = picksState.data;
+    const key = picksState.strategy;
+    $$('[data-picks-strategy]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.picksStrategy === key)));
+    $$('[data-picks-window]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.picksWindow === picksState.window)));
+    $('#picks-picked-only').setAttribute('aria-pressed', String(picksState.pickedOnly));
+    updatePicksHotButton();
+    renderHoldings();  // 持仓建议也跟着所选规则变化
+    if (!data) return;
+
+    const strategy = data.strategies[key];
+    const cost = value => `${(value * 100).toFixed(3)}%`;
+    $('#picks-rule').textContent = `${strategy.name}：${strategy.rule}。收盘后出信号、下一个交易日开盘成交，`
+        + `每笔扣除买入 ${cost(data.costs.buy)}、卖出 ${cost(data.costs.sell)} 的费用。`;
+
+    // 两种规则的结果后端一次算好，切换规则只需要重新排序
+    const rows = data.stocks.map(stock => ({...stock, result: stock.results[key]}))
+        .sort((a, b) => b.result.total_return - a.result.total_return);
+    const picked = rows.filter(row => row.result.picked);
+    const shown = picksState.pickedOnly ? picked : rows;
+
+    $('#picks-topics').innerHTML = data.topics.map(topic => `<button type="button" class="concept-tag" data-picks-topic="${escapeHTML(topic.name)}" title="只回测「${escapeHTML(topic.name)}」">${escapeHTML(topic.name)}${Number.isFinite(topic.change_pct) ? ` <small class="${pickChangeClass(topic.change_pct)}">${formatPercent(topic.change_pct)}</small>` : ''}</button>`).join('');
+    const start = rows.map(row => row.start).sort()[0], end = rows.map(row => row.end).sort().at(-1);
+    $('#picks-summary').innerHTML = `${escapeHTML(data.scope === 'topic' ? `话题「${data.query}」` : '当前热点话题')} · ${escapeHTML(data.window_label)}${rows.length ? `（${escapeHTML(start)} 至 ${escapeHTML(end)}）` : ''} · 回测 ${rows.length} 只 · <strong>入选 ${picked.length} 只</strong>`;
+
+    const body = $('#picks-body');
+    const held = new Set(holdingsState.records.map(record => record.code));
+    body.innerHTML = shown.length ? shown.map((row, index) => {
+        const r = row.result;
+        const isHeld = held.has(row.code);
+        const notes = [row.code, row.days < data.window_days ? `仅 ${row.days} 个交易日` : '', row.adjusted ? '' : '不复权'].filter(Boolean).join(' · ');
+        const topics = row.topics.join('、');
+        return `<tr data-code="${escapeHTML(row.code)}" data-name="${escapeHTML(row.name)}"${r.picked ? ' class="pick-row-picked"' : ''}>
+            <td class="pick-rank">${index + 1}</td>
+            <td><span class="pick-name">${escapeHTML(row.name)}</span>${r.picked ? '<span class="pick-badge">入选</span>' : ''}${isHeld ? '<span class="pick-badge pick-badge-held">已持有</span>' : ''}<small>${escapeHTML(notes)}</small></td>
+            <td class="pick-topic" title="${escapeHTML(topics)}">${escapeHTML(topics)}</td>
+            <td class="${pickChangeClass(r.total_return)}"><b>${pickPercent(r.total_return)}</b></td>
+            <td class="${pickChangeClass(row.benchmark_return)}">${pickPercent(row.benchmark_return)}</td>
+            <td class="${pickChangeClass(r.excess_return)}">${pickPercent(r.excess_return)}</td>
+            <td>${pickPercent(r.max_drawdown)}</td>
+            <td>${r.trades} 次${r.win_rate == null ? '' : ` · ${Math.round(r.win_rate * 100)}%`}</td>
+            <td>${adviceHTML(adviceFor(r, isHeld))}</td>
+        </tr>`;
+    }).join('') : `<tr><td colspan="9">${dataState(picksState.pickedOnly ? '这个规则下暂时没有入选的股票，可以换一种规则或区间看看' : '没有可显示的回测结果')}</td></tr>`;
+    body.querySelectorAll('tr[data-code]').forEach(tr => tr.addEventListener('click', () =>
+        selectStock(tr.dataset.code, stockMarket(tr.dataset.code), tr.dataset.name)));
+    makeKeyboardClickable(body, 'tr[data-code]');
+
+    const names = list => list.map(stock => stock.name || stock.code).join('、');
+    $('#picks-footnote').textContent = [
+        '入选 = 回测区间内策略赚钱、跑赢「持有不动」，并且最新信号看多（含刚出现的买入信号）',
+        '操作建议按「我的持仓」区分：已持有的给继续持有 / 建议卖出，没持有的给建议买入 / 观望',
+        '收益按比例计算，不受 100 股一手的限制',
+        `数据：${data.data_source}`,
+        data.unadjusted ? '不复权数据会把分红除权日的跌价算进收益' : '',
+        data.failed.length ? `${data.failed.length} 只取不到行情：${names(data.failed)}` : '',
+        data.skipped.length ? `${data.skipped.length} 只上市时间太短未回测：${names(data.skipped)}` : '',
+        `计算于 ${displayTime(data.generated_at, true)}${data.cached ? '（10 分钟内的缓存结果）' : ''}`,
+        '历史回测不代表未来表现，仅供研究参考，不构成投资建议',
+    ].filter(Boolean).join(' · ');
+}
+
+// 输入了话题（包括加载失败后）就显示「改用当前热点」，方便一键回到热点话题
+function updatePicksHotButton() {
+    $('#picks-use-hot').classList.toggle('hidden', !$('#picks-topic-input').value.trim() && picksState.data?.scope !== 'topic');
+}
+
+function bindPicks() {
+    $('#picks-form').addEventListener('submit', event => {
+        event.preventDefault();
+        if (!$('#picks-submit').disabled) loadPicks({revealResults: true});
+    });
+    $('#picks-topic-input').addEventListener('input', updatePicksHotButton);
+    $$('[data-picks-strategy]').forEach(btn => btn.addEventListener('click', () => {
+        picksState.strategy = btn.dataset.picksStrategy;
+        renderPicks();
+    }));
+    $$('[data-picks-window]').forEach(btn => btn.addEventListener('click', () => {
+        if (picksState.window === btn.dataset.picksWindow && picksState.data) return;
+        picksState.window = btn.dataset.picksWindow;
+        loadPicks({revealResults: true});
+    }));
+    $('#picks-picked-only').addEventListener('click', () => {
+        picksState.pickedOnly = !picksState.pickedOnly;
+        renderPicks();
+    });
+    $('#picks-use-hot').addEventListener('click', () => {
+        $('#picks-topic-input').value = '';
+        loadPicks({revealResults: true});
+    });
+    $('#picks-topics').addEventListener('click', event => {
+        const tag = event.target.closest('[data-picks-topic]');
+        if (!tag) return;
+        $('#picks-topic-input').value = tag.dataset.picksTopic;
+        loadPicks({revealResults: true});
+    });
+    $('#btn-topic-backtest').addEventListener('click', () =>
+        switchToPicks($('#topic-search-input').value.trim(), {revealResults: true}));
+    renderPicks();
+}
+
+/* ═══════════════════════════════════════════════════════
+   My Holdings — 我的持仓（记录保存在服务器的 data/holdings.json）
+   ═══════════════════════════════════════════════════════ */
+
+const holdingsState = {records: [], signals: {}, strategies: {}, loaded: false, request: 0, selected: null};
+
+async function loadHoldings() {
+    const id = ++holdingsState.request;
+    if (!holdingsState.loaded) $('#holdings-list').innerHTML = dataState('正在读取持仓记录并分析…');
+    try {
+        const response = await window.fetch('/api/holdings', {signal: AbortSignal.timeout(60000)});
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+        if (id !== holdingsState.request) return;
+        Object.assign(holdingsState, {records: data.records || [], signals: data.signals || {},
+            strategies: data.strategies || {}, loaded: true});
+        renderHoldings();
+        if (picksState.data) renderPicks();  // 排名里的操作建议取决于持有了哪些股票
+    } catch (error) {
+        if (id !== holdingsState.request) return;
+        $('#holdings-count').textContent = '读取失败';
+        $('#holdings-list').innerHTML = dataState(error.name === 'TimeoutError' ? '持仓分析超时，请稍后重试' : error.message, 'holdings');
+    }
+}
+
+function renderHoldings() {
+    if (!holdingsState.loaded) return;
+    const records = holdingsState.records;
+    const key = picksState.strategy;
+    $('#holdings-count').textContent = `${records.length} 条记录`;
+    if (!records.length) {
+        $('#holdings-list').innerHTML = dataState('还没有持仓记录。记下买入的股票后，这里会按所选规则给出「继续持有」或「建议卖出」。');
+        return;
+    }
+    const strategyName = holdingsState.strategies[key]?.name || '';
+    $('#holdings-list').innerHTML = `<div class="stock-table-wrap"><table class="stock-table holdings-table"><thead><tr>
+        <th>股票</th><th>买入日期</th><th>买入价</th><th>现价</th><th>盈亏</th><th>${escapeHTML(strategyName)}建议</th><th></th>
+        </tr></thead><tbody>${records.map(record => {
+            const info = holdingsState.signals[record.code];
+            const money = value => value.toLocaleString('zh-CN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            const cost = Number.isFinite(record.buy_price) ? money(record.buy_price) : '—';
+            const costNote = record.price_estimate === 'live' ? `按 ${record.price_estimated_on} 记录时的现价估算`
+                : record.price_estimated_on ? `按 ${record.price_estimated_on} 收盘价估算`
+                : record.buy_price == null ? '没查到当天价格' : '';
+            const price = Number.isFinite(record.price) ? money(record.price) : '—';
+            const profit = Number.isFinite(record.profit) ? `${colorSign(record.profit)}${money(record.profit)} 元` : '';
+            return `<tr data-code="${escapeHTML(record.code)}" data-name="${escapeHTML(record.name || record.code)}">
+                <td><span class="pick-name">${escapeHTML(record.name || record.code)}</span><small>${escapeHTML(record.code)}${info && !info.adjusted ? ' · 不复权' : ''}</small></td>
+                <td>${escapeHTML(record.buy_date)}${record.shares ? `<small>${record.shares} 股</small>` : ''}</td>
+                <td>${cost}${costNote ? `<small>${escapeHTML(costNote)}</small>` : ''}</td>
+                <td>${price}${record.price_is_preclose ? '<small>停牌或未开盘，按昨收</small>' : ''}</td>
+                <td class="${pickChangeClass(record.return_rate)}">${pickPercent(record.return_rate)}${profit ? `<small>${profit}</small>` : ''}</td>
+                <td>${adviceHTML(adviceFor(info?.signals?.[key], true))}</td>
+                <td><button type="button" class="text-btn holding-remove" data-holding-id="${escapeHTML(record.id)}">删除</button></td>
+            </tr>`;
+        }).join('')}</tbody></table></div>`;
+}
+
+function isEligibleHoldingStock(stock) {
+    return /^(60|68|00|30)\d{4}$/.test(stock.code);
+}
+
+async function resolveHoldingStock() {
+    if (holdingsState.selected) return holdingsState.selected;
+    const text = $('#holding-stock').value.trim();
+    const code = text.match(/(?:^|\D)((?:60|68|00|30)\d{4})(?:\D|$)/)?.[1];
+    if (code) return {code, name: ''};
+    if (!text) return null;
+    const response = await requestAPI(`/api/stock/search?keyword=${encodeURIComponent(text)}`);
+    const match = (await response.json()).find(isEligibleHoldingStock);
+    return match ? {code: match.code, name: match.name} : null;
+}
+
+async function addHolding() {
+    const status = $('#holding-status'), button = $('#holding-form button[type="submit"]');
+    if (button.disabled) return;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = '记录中';
+    status.textContent = '正在确认股票信息…';
+    const details = {buy_date: $('#holding-date').value, buy_price: $('#holding-price').value, shares: $('#holding-shares').value};
+    try {
+        const stock = await resolveHoldingStock();
+        if (!stock) {
+            status.textContent = '没找到这只股票，请从下拉列表里选择沪深 A 股';
+            return;
+        }
+        status.textContent = '正在保存买入记录…';
+        const response = await window.fetch('/api/holdings', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, signal: AbortSignal.timeout(30000),
+            body: JSON.stringify({code: stock.code, name: stock.name, ...details}),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `记录失败 (${response.status})`);
+        const priceNote = data.price_estimate === 'live' ? `，买入价按记录时的现价 ${data.buy_price.toFixed(2)} 元估算`
+            : data.price_estimated_on ? `，买入价按 ${data.price_estimated_on} 收盘价 ${data.buy_price.toFixed(2)} 元估算`
+            : data.buy_price == null ? '，没查到当天价格，盈亏暂不计算' : '';
+        status.textContent = `已记录：${data.name} ${data.buy_date} 买入${priceNote}`;
+        holdingsState.selected = null;
+        ['#holding-stock', '#holding-price', '#holding-shares'].forEach(selector => { $(selector).value = ''; });
+        await loadHoldings();
+    } catch (error) {
+        status.textContent = error.name === 'TimeoutError' ? '记录超时，请稍后重试' : error.message;
+    } finally {
+        button.disabled = false;
+        button.setAttribute('aria-busy', 'false');
+        button.textContent = '记录买入';
+    }
+}
+
+async function removeHolding(button, name) {
+    if (button.disabled) return;
+    if (!confirm(`删除「${name}」的这条买入记录？`)) return;
+    const status = $('#holding-status');
+    const id = button.dataset.holdingId;
+    button.disabled = true;
+    button.textContent = '删除中…';
+    try {
+        const response = await window.fetch(`/api/holdings/${encodeURIComponent(id)}`, {method: 'DELETE', signal: AbortSignal.timeout(15000)});
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `删除失败 (${response.status})`);
+        status.textContent = `已删除「${name}」的买入记录`;
+        showActionFeedback(status.textContent);
+        await loadHoldings();
+    } catch (error) {
+        status.textContent = error.name === 'TimeoutError' ? '删除超时，请稍后重试' : error.message;
+        showActionFeedback(status.textContent);
+    } finally {
+        button.disabled = false;
+        button.textContent = '删除';
+    }
+}
+
+function bindHoldings() {
+    const input = $('#holding-stock'), suggestions = $('#holding-suggestions');
+    const today = researchDate(beijingTime());
+    $('#holding-date').max = today;
+    $('#holding-date').value = today;
+    input.addEventListener('input', () => { holdingsState.selected = null; });
+    const closeSearch = bindStockLookup(input, suggestions, stock => {
+        holdingsState.selected = {code: stock.code, name: stock.name};
+        input.value = `${stock.name} ${stock.code}`;
+    }, {filter: isEligibleHoldingStock, selectOnEnter: false});
+    $('#holding-form').addEventListener('submit', event => {
+        event.preventDefault();
+        closeSearch();
+        addHolding();
+    });
+    $('#holdings-list').addEventListener('click', event => {
+        const remove = event.target.closest('[data-holding-id]');
+        if (remove) { removeHolding(remove, remove.closest('tr').dataset.name); return; }
+        const row = event.target.closest('tr[data-code]');
+        if (row) selectStock(row.dataset.code, stockMarket(row.dataset.code), row.dataset.name);
+    });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -1229,12 +1847,16 @@ async function searchTopic() {
 
 function initNavigation() {
     bindGlobalSearch();
+    bindStockResearch();
+    bindPicks();
+    bindHoldings();
     document.addEventListener('click', e => {
         const retry = e.target.closest('[data-retry]');
         if (!retry) return;
         const actions = {indices:loadIndexQuotes, popular:loadPopularStocks, news:() => loadHotNews(true), commentary:() => state.currentStock && loadCommentary(state.currentStock.code),
+            research:() => state.currentStock && loadStockResearch(state.currentStock.code),
             constituents:() => state.selectedIndex && loadConstituents(state.selectedIndex.code, state.selectedIndex.name),
-            topic:searchTopic, 'stock-info':() => state.currentStock && loadStockInfo(state.currentStock.code, state.currentStock.market),
+            topic:searchTopic, picks:() => loadPicks({revealResults: true}), holdings:loadHoldings, 'stock-info':() => state.currentStock && loadStockInfo(state.currentStock.code, state.currentStock.market),
             chart:() => {
                 const stock = state.currentStock;
                 if (!stock) return;
@@ -1265,7 +1887,12 @@ function initNavigation() {
             // Update hash
             if (viewId === 'market') setHash('market');
             else if (viewId === 'discover') setHash('discover');
+            else if (viewId === 'picks') setHash('picks', $('#picks-topic-input').value.trim() || null);
             else if (viewId === 'stock-detail' && state.currentStock) setHash('stock', state.currentStock.code);
+
+            // First visit (or after a failed load): backtest the current hot topics
+            if (viewId === 'picks') loadHoldings();
+            if (viewId === 'picks' && !picksState.loaded && $('#picks-loading').classList.contains('hidden')) loadPicks();
 
             // Load discover default on first visit
             if (viewId === 'discover') {
@@ -1373,34 +2000,50 @@ function initNavigation() {
         refreshBtn.addEventListener('click', async () => {
             if (refreshBtn.disabled) return;
             refreshBtn.disabled = true;
-            try { await Promise.allSettled([loadIndexQuotes(), refreshWatchlistQuotes(), loadPopularStocks(), loadHotNews(true)]); } finally { refreshBtn.disabled = false; }
-            /* individual stock panels refresh independently */
-            
-            if (state.currentStock) {
-                if (state.currentPeriod === 'intraday') {
-                    loadIntradayChart(state.currentStock.code, state.currentStock.market, state.currentStock.name);
-                } else {
-                    loadKlineChart(state.currentStock.code, state.currentStock.market, state.currentPeriod);
+            refreshBtn.setAttribute('aria-busy', 'true');
+            showActionFeedback('正在刷新行情与热点…');
+            try {
+                const tasks = [loadIndexQuotes(), refreshWatchlistQuotes(), loadPopularStocks(), loadHotNews(true)];
+                const stock = state.currentStock;
+                if (stock && $('#view-stock-detail').classList.contains('active')) {
+                    if (state.currentPeriod === 'intraday') loadIntradayChart(stock.code, stock.market, stock.name);
+                    else loadKlineChart(stock.code, stock.market, state.currentPeriod);
+                    $('#stock-quote-status').textContent = '正在刷新个股行情…';
+                    loadStockInfo(stock.code, stock.market);
+                    loadCommentary(stock.code);
                 }
-                loadStockInfo(state.currentStock.code, state.currentStock.market);
-                loadCommentary(state.currentStock.code);
+                const refreshed = await Promise.allSettled(tasks);
+                const failed = refreshed.some(item => item.status === 'rejected' || item.value === false);
+                const pending = refreshed[3].value === 'pending';
+                showActionFeedback(failed ? '部分行情或资讯暂未更新，请查看各栏提示' :
+                    pending ? '行情已刷新，热点仍在抓取' : '行情与热点已刷新');
+            } finally {
+                refreshBtn.disabled = false;
+                refreshBtn.setAttribute('aria-busy', 'false');
             }
         });
     }
 
     // Refresh popular stocks button
     const refreshPopBtn = $('#btn-refresh-popular');
-    if (refreshPopBtn) refreshPopBtn.addEventListener('click', loadPopularStocks);
+    if (refreshPopBtn) refreshPopBtn.addEventListener('click', async () => {
+        if (refreshPopBtn.disabled) return;
+        refreshPopBtn.disabled = true;
+        refreshPopBtn.textContent = '刷新中…';
+        try {
+            showActionFeedback(await loadPopularStocks() ? '活跃股已刷新' : '活跃股行情暂不可用');
+        } finally {
+            refreshPopBtn.disabled = false;
+            refreshPopBtn.textContent = '刷新';
+        }
+    });
 
     // Clear watchlist
     const clearWlBtn = $('#btn-clear-watchlist-strip');
     if (clearWlBtn) {
         clearWlBtn.addEventListener('click', () => {
             if (state.watchlist.length && confirm('确定清空所有自选股？')) {
-                state.watchlist = [];
-                saveWatchlist();
-                refreshWatchlistQuotes();
-                updateStarButton();
+                updateWatchlist([], '已清空自选');
             }
         });
     }
@@ -1409,80 +2052,21 @@ function initNavigation() {
     const searchBtn = $('#topic-search-btn');
     const searchInput = $('#topic-search-input');
     if (searchBtn) searchBtn.addEventListener('click', searchTopic);
-    if (searchInput) searchInput.addEventListener('keydown', e => { if (e.key==='Enter') searchTopic(); });
+    if (searchInput) searchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) searchTopic();
+    });
 
-    // Stock detail search
-    const sdSearch = $('#stock-detail-search');
-    const sdSug = $('#stock-detail-suggestions');
-    if (sdSearch && sdSug) {
-        let sdTimer;
-        sdSearch.addEventListener('input', () => {
-            clearTimeout(sdTimer);
-            const kw = sdSearch.value.trim();
-            if (kw.length < 1) { sdSug.classList.remove('show'); return; }
-            sdTimer = setTimeout(async () => {
-                try {
-                    const r = await requestAPI(`/api/stock/search?keyword=${encodeURIComponent(kw)}`);
-                    const data = await r.json();
-                    if (sdSearch.value.trim() !== kw) return;
-                    if (!data.length) { sdSug.classList.remove('show'); return; }
-                    sdSug.innerHTML = data.map(s => `<div class="suggestion-item" data-code="${s.code}" data-market="${s.market}" data-name="${escapeHTML(s.name)}">
-                        <span>${escapeHTML(s.name)}</span><span style="color:var(--tx3)">${s.full_code}</span></div>`).join('');
-                    sdSug.classList.add('show');
-                } catch(e) {}
-            }, 250);
-        });
-        sdSearch.addEventListener('keydown', e => {
-            if (e.key === 'Enter') {
-                sdSug.classList.remove('show');
-                const kw = sdSearch.value.trim();
-                if (kw) autoSelectStock(kw, sdSearch);
-            }
-        });
-        sdSug.addEventListener('click', (e) => {
-            const item = e.target.closest('.suggestion-item');
-            if (!item) return;
-            sdSug.classList.remove('show');
-            sdSearch.value = item.dataset.name;
-            selectStock(item.dataset.code, parseInt(item.dataset.market), item.dataset.name);
-        });
-        document.addEventListener('click', e => {
-            if (!sdSearch.contains(e.target) && !sdSug.contains(e.target)) sdSug.classList.remove('show');
-        });
-    }
+    const detailInput = $('#stock-detail-search');
+    bindStockLookup(detailInput, $('#stock-detail-suggestions'), stock => {
+        detailInput.value = stock.name;
+        selectStock(stock.code, stock.market, stock.name);
+    });
 
-    // Watchlist add search (in horizontal strip)
-    const wlInput = $('#wl-strip-add-input');
-    const wlSug = $('#wl-strip-suggestions');
-    if (wlInput && wlSug) {
-        let wlTimer;
-        wlInput.addEventListener('input', () => {
-            clearTimeout(wlTimer);
-            const kw = wlInput.value.trim();
-            if (kw.length < 1) { wlSug.classList.remove('show'); return; }
-            wlTimer = setTimeout(async () => {
-                try {
-                    const r = await requestAPI(`/api/stock/search?keyword=${encodeURIComponent(kw)}`);
-                    const data = await r.json();
-                    if (wlInput.value.trim() !== kw) return;
-                    if (!data.length) { wlSug.classList.remove('show'); return; }
-                    wlSug.innerHTML = data.map(s => `<div class="ws-item" data-code="${s.code}" data-name="${escapeHTML(s.name)}">
-                        <span>${escapeHTML(s.name)}</span><span class="ws-code">${s.code}</span></div>`).join('');
-                    wlSug.classList.add('show');
-                } catch(e) {}
-            }, 250);
-        });
-        wlSug.addEventListener('click', (e) => {
-            const item = e.target.closest('.ws-item');
-            if (!item) return;
-            wlSug.classList.remove('show');
-            wlInput.value = '';
-            addToWatchlist(item.dataset.code, item.dataset.name);
-        });
-        document.addEventListener('click', e => {
-            if (!wlInput.contains(e.target) && !wlSug.contains(e.target)) wlSug.classList.remove('show');
-        });
-    }
+    const watchlistInput = $('#wl-strip-add-input');
+    bindStockLookup(watchlistInput, $('#wl-strip-suggestions'), stock => {
+        watchlistInput.value = '';
+        addToWatchlist(stock.code, stock.name);
+    });
 
     // Logo click → market view
     $('.logo').addEventListener('click', switchToMarket);
@@ -1493,50 +2077,96 @@ function initNavigation() {
     });
 }
 
-function bindGlobalSearch() {
-    const input = $('#global-stock-search'), suggestions = $('#global-stock-suggestions');
+function bindStockLookup(input, suggestions, onChoose, {filter = () => true, selectOnEnter = true} = {}) {
     let timer, version = 0;
-    input.addEventListener('input', () => {
-        clearTimeout(timer);
-        const id = ++version, keyword = input.value.trim();
-        if (!keyword) { suggestions.classList.remove('show'); return; }
-        timer = setTimeout(async () => {
-            try {
-                const r = await requestAPI(`/api/stock/search?keyword=${encodeURIComponent(keyword)}`), results = await r.json();
-                if (id !== version) return;
-                suggestions.innerHTML = results.length ? results.slice(0,8).map(stock => `<button type="button" class="suggestion-item" data-code="${escapeHTML(stock.code)}" data-name="${escapeHTML(stock.name)}" data-market="${stock.market}"><span>${escapeHTML(stock.name)}</span><span>${escapeHTML(stock.code)}</span></button>`).join('') : '<div class="data-state">未找到相关股票</div>';
-                suggestions.classList.add('show');
-            } catch { if (id === version) {suggestions.innerHTML = '<div class="data-state">搜索源暂不可用</div>';suggestions.classList.add('show');} }
-        }, 250);
-    });
-    suggestions.addEventListener('click', e => {
-        const item = e.target.closest('[data-code]');
-        if (!item) return;
+    input.setAttribute('aria-controls', suggestions.id);
+
+    function closeSearch() {
         version++;
-        suggestions.classList.remove('show'); input.value = '';
-        selectStock(item.dataset.code, Number(item.dataset.market), item.dataset.name);
+        clearTimeout(timer);
+        input.removeAttribute('aria-busy');
+        suggestions.classList.remove('show');
+    }
+
+    function showStatus(message) {
+        suggestions.innerHTML = `<div class="search-feedback" role="status">${escapeHTML(message)}</div>`;
+        suggestions.classList.add('show');
+    }
+
+    async function search(keyword, id, chooseFirst) {
+        try {
+            const response = await requestAPI(`/api/stock/search?keyword=${encodeURIComponent(keyword)}`);
+            const stocks = (await response.json()).filter(filter);
+            if (id !== version) return;
+            if (!stocks.length) {
+                showStatus('未找到匹配的股票，请试试代码或简称');
+            } else if (chooseFirst) {
+                closeSearch();
+                onChoose(stocks[0]);
+            } else {
+                suggestions.innerHTML = stocks.slice(0, 8).map(stock => `<button type="button" class="suggestion-item" data-code="${escapeHTML(stock.code)}" data-name="${escapeHTML(stock.name)}" data-market="${escapeHTML(stock.market)}">
+                    <span>${escapeHTML(stock.name)}</span><span>${escapeHTML(stock.code)}</span></button>`).join('');
+            }
+        } catch {
+            if (id === version) showStatus('股票搜索暂不可用，请稍后重试');
+        } finally {
+            if (id === version) input.removeAttribute('aria-busy');
+        }
+    }
+
+    function startSearch(immediate) {
+        closeSearch();
+        const keyword = input.value.trim();
+        if (!keyword) return;
+        const id = version;
+        showStatus('正在搜索股票…');
+        input.setAttribute('aria-busy', 'true');
+        if (immediate) search(keyword, id, true);
+        else timer = setTimeout(() => search(keyword, id, false), 250);
+    }
+
+    input.addEventListener('input', () => startSearch(false));
+    input.addEventListener('keydown', event => {
+        if (event.isComposing || event.keyCode === 229) return;
+        if (event.key === 'Escape') closeSearch();
+        if (event.key === 'Enter' && selectOnEnter) {
+            event.preventDefault();
+            startSearch(true);
+        }
+        if (event.key === 'ArrowDown' && suggestions.classList.contains('show')) {
+            event.preventDefault();
+            suggestions.querySelector('button')?.focus();
+        }
     });
-    input.addEventListener('keydown', e => {
-        if (e.key === 'Escape') { version++; suggestions.classList.remove('show'); input.blur(); }
-        if (e.key === 'Enter') { version++; suggestions.classList.remove('show'); if (input.value.trim()) autoSelectStock(input.value.trim(), input); }
-        if (e.key === 'ArrowDown') { e.preventDefault(); suggestions.querySelector('button')?.focus(); }
+    suggestions.addEventListener('click', event => {
+        const item = event.target.closest('button[data-code]');
+        if (!item) return;
+        closeSearch();
+        onChoose({code: item.dataset.code, name: item.dataset.name, market: Number(item.dataset.market)});
     });
-    document.addEventListener('keydown', e => {
-        if (e.key === '/' && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) { e.preventDefault(); input.focus(); }
+    suggestions.addEventListener('keydown', event => {
+        if (event.key !== 'Escape') return;
+        closeSearch();
+        input.focus();
     });
-    document.addEventListener('click', e => { if (!e.target.closest('.global-search')) { version++; clearTimeout(timer); suggestions.classList.remove('show'); } });
+    document.addEventListener('click', event => {
+        if (event.target !== input && !suggestions.contains(event.target)) closeSearch();
+    });
+    return closeSearch;
 }
 
-async function autoSelectStock(keyword, inputEl) {
-    try {
-        const r = await requestAPI(`/api/stock/search?keyword=${encodeURIComponent(keyword)}`);
-        const data = await r.json();
-        if (data.length) {
-            const s = data[0];
-            inputEl.value = s.name;
-            selectStock(s.code, s.market, s.name);
+function bindGlobalSearch() {
+    const input = $('#global-stock-search');
+    bindStockLookup(input, $('#global-stock-suggestions'), stock => {
+        input.value = '';
+        selectStock(stock.code, stock.market, stock.name);
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key === '/' && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) {
+            event.preventDefault();
+            input.focus();
         }
-    } catch(e) {}
+    });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -1575,6 +2205,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadWatchlist();
     initNavigation();
     loadIndexQuotes();
+    renderWatchlist();
     refreshWatchlistQuotes();
     loadPopularStocks();
     loadHotNews();
