@@ -27,6 +27,9 @@ import xlrd
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from flask import Flask, jsonify, render_template, request
+from company_research import CNINFO_QUERY, collect_research, parse_window
+from backtest_picker import BUY_COST, SELL_COST, STRATEGIES, WINDOWS, latest_signals, load_bars, pick_stocks
+from holdings import HoldingFileError, HoldingStore, parse_holding
 
 app = Flask(__name__)
 
@@ -48,7 +51,8 @@ SINA_SUGGEST_URL = "https://suggest3.sinajs.cn/suggest/type=11"
 # 东方财富 API
 EM_SEARCH_URL = "https://searchadapter.eastmoney.com/api/suggest/get"
 EM_QUOTE_API = "https://push2.eastmoney.com/api/qt"
-EM_CLIST_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
+# 82.push2 这类编号节点经常直接断开连接（实测 12 次只成功 1 次），主域名稳定得多
+EM_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EM_NEWS_URL = "https://search-api-web.eastmoney.com/search/jsonp"
 PERIODS = {"daily": 240, "weekly": 1200, "monthly": 7200}
@@ -66,7 +70,10 @@ except ImportError:
 _cache = OrderedDict()
 _cache_lock = Lock()
 CACHE_TTL = {"concepts": 3600, "concept_stocks": 1800, "kline": 120, "intraday": 30,
-             "search": 300, "info": 30, "index": 30, "popular": 30, "index_members": 21600, "index_stocks": 60, "news": 300}
+             "search": 300, "info": 30, "index": 30, "popular": 30, "index_members": 21600, "index_stocks": 60, "news": 300,
+             "research_directory": 21600, "research_profile": 21600, "research_financial": 1800,
+             "research_disclosures": 900, "research_media": 900, "research_sina": 300,
+             "pick_kline": 1800, "picks": 600}
 MAX_CACHE = 500
 
 def _cache_key(*parts): return ":".join(str(p) for p in parts)
@@ -113,13 +120,24 @@ def similarity(a: str, b: str) -> float:
 def sina_symbol(market: int, code: str) -> str:
     return f"{'sh' if market == 1 else 'sz'}{code}"
 
-def http_get(url, params=None, headers=None, timeout=8):
-    try:
-        r = requests.get(url, params=params, headers=headers or HEADERS, timeout=timeout, verify=True)
-        r.raise_for_status()
-        return r, None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+def http_get(url, params=None, headers=None, timeout=8, retries=1):
+    error = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, headers=headers or HEADERS, timeout=timeout, verify=True)
+            r.raise_for_status()
+            return r, None
+        except requests.Timeout as e:  # 超时不重试，避免等待时间翻倍
+            error = e
+            break
+        except requests.ConnectionError as e:  # 行情源偶尔直接断开连接，稍等再试一次
+            error = e
+            if attempt < retries:
+                time.sleep(0.4)
+        except Exception as e:
+            error = e
+            break
+    return None, f"{type(error).__name__}: {error}"
 
 def response_json(response, jsonp=False):
     if response is None:
@@ -270,7 +288,8 @@ def get_stock_info(market: int, code: str) -> dict:
         quote = pool.submit(http_get, SINA_QUOTE_URL.format(symbols=symbol))
         metrics = pool.submit(http_get, f"{EM_QUOTE_API}/stock/get", params={
             "secid": f"{market}.{code}", "fltt": 2,
-            "fields": "f57,f58,f116,f162,f168,f43,f169,f170,f47,f48,f124",
+            # 新浪失败时整份行情都靠这些字段，开盘/最高/最低/昨收/振幅不能漏
+            "fields": "f57,f58,f116,f162,f168,f43,f44,f45,f46,f60,f169,f170,f171,f47,f48,f124",
         }, timeout=7)
         response, _ = quote.result()
         data = em_payload(metrics.result()[0])
@@ -292,7 +311,9 @@ def get_stock_info(market: int, code: str) -> dict:
                 "amplitude": round((high - low) / preclose * 100, 2) if low > 0 else None,
                 "quote_time": f"{f[30]} {f[31]}" if len(f) > 31 else "", "quote_source": "新浪财经"}
     if not result and data.get("f58") and safe_float(data.get("f43")) > 0:
-        result = {"code": code, "name": data["f58"], "quote_time": "", "quote_source": "东方财富"}
+        stamp = safe_float(data.get("f124"))  # 行情更新时间（Unix 秒）
+        result = {"code": code, "name": data["f58"], "quote_source": "东方财富",
+                  "quote_time": datetime.fromtimestamp(stamp, CHINA_TZ).strftime("%Y-%m-%d %H:%M:%S") if stamp > 0 else ""}
         for field, key in {"price":"f43", "high":"f44", "low":"f45", "open":"f46",
                            "volume":"f47", "amount":"f48", "preclose":"f60",
                            "change_amt":"f169", "change_pct":"f170", "amplitude":"f171"}.items():
@@ -1118,7 +1139,8 @@ _commentary_pending = {}
 
 def make_stock_reading(info, kline):
     valid = [d for d in kline if d.get("close", 0) > 0]
-    price, change = info.get("price", 0), info.get("change_pct", 0)
+    # 备用行情源的字段可能是 None，统一按 0 处理，避免比较大小时报错
+    price, change = info.get("price") or 0, info.get("change_pct") or 0
     if not price or not info.get("name"):
         return {"mode": "unavailable", "summary": "暂时无法取得有效行情，数据恢复后可重新打开查看。", "points": [],
                 "generated_at": datetime.now(CHINA_TZ).isoformat(), "quote_time": "", "notice": "行情源暂不可用"}
@@ -1140,10 +1162,10 @@ def make_stock_reading(info, kline):
             if average > 0:
                 ratio = volumes[-1] / average
                 points.append({"label": "量能观察", "text": f"最近日线成交量为前 5 日均量的 {ratio:.2f} 倍"})
-    high, low = info.get("high", 0), info.get("low", 0)
+    high, low = info.get("high") or 0, info.get("low") or 0
     if high > 0 and low > 0:
         points.append({"label": "当日区间", "text": f"{low:.2f} – {high:.2f} 元"})
-    amplitude = info.get("amplitude", 0)
+    amplitude = info.get("amplitude") or 0
     if amplitude >= 5 or abs(change) >= 5:
         summary += "价格波动较大，需关注回撤和流动性风险。"
     else:
@@ -1223,6 +1245,229 @@ def api_stock_commentary(stock_code):
     if market is None:
         return jsonify({"error": "请输入有效的六位股票代码"}), 400
     return jsonify(get_stock_commentary(market, code))
+
+
+def post_research_form(url, data):
+    if url != CNINFO_QUERY:
+        return None
+    try:
+        response = requests.post(url, data=data, timeout=7, verify=True,
+                                 headers={**HEADERS, "Referer": "https://www.cninfo.com.cn/"})
+        response.raise_for_status()
+        return response
+    except requests.RequestException:
+        return None
+
+
+@app.route("/api/stock/<stock_code>/research")
+def api_stock_research(stock_code):
+    market, code = parse_stock_input(stock_code)
+    if market is None or not is_a_stock(code, market):
+        return jsonify(error="公司研究暂支持沪深 A 股，请输入有效的证券代码"), 400
+    try:
+        start, end = parse_window(request.args.get("start"), request.args.get("end"))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(collect_research(http_get, post_research_form, _cache_get, _cache_set,
+                                    code, market, start, end))
+
+
+# ─── 回测选股 ───
+
+PICK_TOPICS, PICK_PER_TOPIC = 5, 8
+
+
+def pick_market(code):
+    return 1 if code.startswith(("6", "9")) else 0
+
+
+def hot_topic_universe():
+    """热点雷达排名前几的话题，每个话题取市值最大的几只沪深 A 股。"""
+    topics = [t for t in get_hot_news().get("topics", []) if isinstance(t, dict) and t.get("name")][:PICK_TOPICS]
+    if not topics:
+        raise SourceUnavailable("暂未取得热点话题，请稍后重试")
+    boards = []
+    for topic in topics:
+        code = topic.get("code")
+        if not re.fullmatch(r"BK[0-9]+", str(code or "")):
+            try:  # 从资讯标题提取的话题没有板块代码，按名称找对应的概念板块
+                found = search_concepts(topic["name"], top_n=1)
+            except SourceUnavailable:
+                found = []
+            code = found[0]["code"] if found else None
+        if code:
+            boards.append({"name": topic["name"], "code": code, "change_pct": topic.get("change_pct")})
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        members = list(pool.map(lambda board: get_concept_stocks(board["code"], top_n=PICK_PER_TOPIC), boards))
+    stocks = {}
+    for board, rows in zip(boards, members):
+        for row in rows:
+            stock = stocks.setdefault(row["code"], {**row, "market": pick_market(row["code"]), "topics": []})
+            stock["topics"].append(board["name"])
+    return [{"name": b["name"], "change_pct": b["change_pct"]} for b in boards], list(stocks.values())
+
+
+def topic_universe(query):
+    """和「热点发现」页相同的匹配逻辑：话题对应的概念板块成分股，找不到时按名称搜索。"""
+    matched = match_query_to_stocks(query)
+    topics = [{"name": c["name"], "change_pct": None} for c in matched["concepts"]]
+    stocks = [{**s, "market": pick_market(s["code"]), "topics": [s.get("matched_via") or query]}
+              for s in matched["stocks"] if is_a_stock(s["code"])]
+    return topics, stocks, matched["match_status"]
+
+
+def run_picks(scope, query, window):
+    key = _cache_key("picks", scope, query.lower() if scope == "topic" else "-", window)
+    cached = _cache_get(key)
+    if cached:
+        return {**cached, "cached": True}
+    if scope == "hot":
+        (topics, stocks), status = hot_topic_universe(), "unavailable"
+    else:
+        topics, stocks, status = topic_universe(query)
+    if not stocks:
+        # 区分"话题确实没有相关股票"和"板块数据源暂时取不到"，避免误导
+        raise SourceUnavailable("没有找到和这个话题相关的沪深 A 股" if status == "ok"
+                                else "板块成分股暂时取不到（行情源繁忙），请稍后重试")
+    # 腾讯前复权数据取不到时，退回到个股图表使用的新浪日线（不复权）
+    rows, failed, skipped = pick_stocks(http_get, _cache_get, _cache_set, stocks, window, fallback=daily_bars_fallback)
+    if not rows and failed:
+        raise SourceUnavailable("历史行情暂不可用，请稍后重试")
+    unadjusted = sum(not row["adjusted"] for row in rows)
+    source = ("腾讯财经前复权日线" if not unadjusted else "新浪财经不复权日线（腾讯行情暂不可用）"
+              if unadjusted == len(rows) else f"腾讯财经前复权日线；{unadjusted} 只改用新浪不复权日线")
+    result = {"scope": scope, "query": query if scope == "topic" else "", "window": window,
+              "window_label": WINDOWS[window][1], "window_days": WINDOWS[window][0],
+              "topics": topics, "stocks": rows, "failed": failed, "skipped": skipped,
+              "strategies": STRATEGIES, "costs": {"buy": BUY_COST, "sell": SELL_COST},
+              "data_source": source, "unadjusted": unadjusted,
+              "generated_at": datetime.now(CHINA_TZ).isoformat(), "cached": False}
+    if rows and not failed and not unadjusted:  # 结果不完整时不缓存，下次重新尝试
+        _cache_set(key, result)
+    return result
+
+
+@app.route("/api/picks")
+def api_picks():
+    scope = request.args.get("scope", "hot")
+    window = request.args.get("window", "year")
+    query = request.args.get("query", "").strip()[:80]
+    if scope not in {"hot", "topic"} or window not in WINDOWS:
+        return jsonify(error="无效的回测参数"), 400
+    if scope == "topic" and not query:
+        return jsonify(error="请输入要回测的话题"), 400
+    try:
+        return jsonify(run_picks(scope, query, window))
+    except SourceUnavailable as exc:
+        return jsonify(error=str(exc)), 503
+
+
+# ─── 我的持仓 ───
+
+holding_store = HoldingStore(Path(__file__).parent / "data" / "holdings.json")
+
+
+def daily_bars_fallback(market, code, count):
+    return get_kline(market, code, "daily", count)
+
+
+def sina_quotes(codes):
+    """新浪实时行情，一次请求多只股票。停牌或未开盘时现价为 0，改用昨收并标注。"""
+    codes = [code for code in dict.fromkeys(codes) if is_a_stock(code)]
+    if not codes:
+        return {}
+    symbols = ",".join(sina_symbol(pick_market(code), code) for code in codes)
+    response, _ = http_get(SINA_QUOTE_URL.format(symbols=symbols))
+    if response is None:
+        return {}
+    response.encoding = "gb18030"
+    quotes = {}
+    for code in codes:
+        match = re.search(rf'var hq_str_s[hz]{code}="([^"]*)"', response.text)
+        fields = match[1].split(",") if match else []
+        if len(fields) < 32 or not fields[0] or safe_float(fields[2]) <= 0:
+            continue
+        price, preclose = safe_float(fields[3]), safe_float(fields[2])
+        quotes[code] = {"name": fields[0], "price": price or preclose, "price_is_preclose": not price,
+                        "quote_time": f"{fields[30]} {fields[31]}"}
+    return quotes
+
+
+def close_on(market, code, day):
+    """day 当天的不复权收盘价；当天不是交易日就取之前最近一个交易日。查不到返回 (None, None)。"""
+    bars = [bar for bar in get_kline(market, code, "daily", 1023) if bar["date"][:10] <= day]
+    return (bars[-1]["close"], bars[-1]["date"][:10]) if bars else (None, None)
+
+
+def holdings_overview():
+    records = holding_store.load()
+    codes = list(dict.fromkeys(str(r.get("code")) for r in records if is_a_stock(str(r.get("code")))))
+    quotes = sina_quotes(codes)
+    loaded = load_bars(http_get, _cache_get, _cache_set, [{"code": c, "market": pick_market(c)} for c in codes],
+                       fallback=daily_bars_fallback) if codes else []
+    signals = {stock["code"]: {"signals": latest_signals(data["bars"]), "adjusted": data["adjusted"],
+                               "as_of": data["bars"][-1]["date"] if data["bars"] else None}
+               for stock, data in loaded}
+    items = []
+    for record in sorted(records, key=lambda r: (str(r.get("buy_date")), str(r.get("created_at"))), reverse=True):
+        quote = quotes.get(record.get("code")) or {}
+        price, cost, shares = quote.get("price"), record.get("buy_price"), record.get("shares")
+        items.append({**record, "price": price, "price_is_preclose": quote.get("price_is_preclose", False),
+                      "quote_time": quote.get("quote_time"),
+                      "return_rate": price / cost - 1 if price and cost else None,
+                      "profit": (price - cost) * shares if price and cost and shares else None})
+    return {"records": items, "signals": signals, "strategies": STRATEGIES,
+            "generated_at": datetime.now(CHINA_TZ).isoformat()}
+
+
+@app.route("/api/holdings")
+def api_holdings():
+    try:
+        return jsonify(holdings_overview())
+    except HoldingFileError as exc:
+        return jsonify(error=f"{exc}，请检查或备份这个文件"), 500
+
+
+@app.route("/api/holdings", methods=["POST"])
+def api_add_holding():
+    if not request.is_json:  # 只接受 JSON：别的网站无法用普通表单偷偷提交
+        return jsonify(error="请求格式错误"), 415
+    try:
+        record = parse_holding(request.get_json(silent=True))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    code, market = record["code"], pick_market(record["code"])
+    quote = sina_quotes([code]).get(code)
+    name = quote["name"] if quote else record["name"] or next(
+        (s["name"] for s in search_stocks(code) if s["code"] == code), "")
+    if not name:
+        return jsonify(error="暂时查不到这只股票（代码不存在或行情源繁忙），请稍后重试"), 400
+    estimated_on, estimate = None, None
+    if record["buy_price"] is None:  # 没填买入价：估算一个
+        if quote and not quote["price_is_preclose"] and quote["quote_time"][:10] == record["buy_date"]:
+            # 当天买入：新浪日线收盘后才有当天这一根，用实时现价，否则会拿到前一个交易日的收盘价
+            record["buy_price"], estimated_on, estimate = quote["price"], record["buy_date"], "live"
+        else:  # 过去买入：按当天（不是交易日就取之前最近一个交易日）的收盘价
+            record["buy_price"], estimated_on = close_on(market, code, record["buy_date"])
+            estimate = "close" if estimated_on else None
+    try:
+        entry = holding_store.add({**record, "name": name, "price_estimated_on": estimated_on, "price_estimate": estimate})
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except HoldingFileError as exc:
+        return jsonify(error=f"{exc}，请检查或备份这个文件"), 500
+    return jsonify(entry), 201
+
+
+@app.route("/api/holdings/<record_id>", methods=["DELETE"])
+def api_delete_holding(record_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", record_id):
+        return jsonify(error="无效的记录编号"), 400
+    try:
+        removed = holding_store.remove(record_id)
+    except HoldingFileError as exc:
+        return jsonify(error=f"{exc}，请检查或备份这个文件"), 500
+    return jsonify(ok=True) if removed else (jsonify(error="记录不存在或已删除"), 404)
 
 
 # ─── 多股票批量行情 ───
