@@ -28,8 +28,12 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from flask import Flask, jsonify, render_template, request
 from company_research import CNINFO_QUERY, collect_research, parse_window
-from backtest_picker import BUY_COST, SELL_COST, STRATEGIES, WINDOWS, latest_signals, load_bars, pick_stocks
+from backtest_picker import BUY_COST, SELL_COST, STRATEGIES, WINDOWS, fetch_daily_bars, latest_signals, load_bars, pick_stocks
 from holdings import HoldingFileError, HoldingStore, parse_holding
+from steady_strategy import (
+    STRATEGY as STEADY_RULE, breakout_reading, closed_bars, entry_open_passed, pool_period, read_snapshot,
+    verified_previous_session,
+)
 
 app = Flask(__name__)
 
@@ -73,7 +77,7 @@ CACHE_TTL = {"concepts": 3600, "concept_stocks": 1800, "kline": 120, "intraday":
              "search": 300, "info": 30, "index": 30, "popular": 30, "index_members": 21600, "index_stocks": 60, "news": 300,
              "research_directory": 21600, "research_profile": 21600, "research_financial": 1800,
              "research_disclosures": 900, "research_media": 900, "research_sina": 300,
-             "pick_kline": 1800, "picks": 600}
+             "pick_kline": 1800, "picks": 600, "steady_bars": 300}
 MAX_CACHE = 500
 
 def _cache_key(*parts): return ":".join(str(p) for p in parts)
@@ -1360,6 +1364,98 @@ def api_picks():
         return jsonify(run_picks(scope, query, window))
     except SourceUnavailable as exc:
         return jsonify(error=str(exc)), 503
+
+
+# ─── 稳健派 · 月度候选与个股信号 ───
+
+def steady_snapshot():
+    try:
+        return read_snapshot()
+    except (OSError, ValueError):
+        return None
+
+
+@app.route("/api/steady/pool")
+def api_steady_pool():
+    snapshot = steady_snapshot()
+    if snapshot is None:
+        return jsonify(error="月度股票池暂不可用"), 503
+    return jsonify(**pool_period(snapshot, datetime.now(CHINA_TZ)), strategy=STEADY_RULE,
+                   archive_through=snapshot["archive_through"],
+                   stocks=[{key: row[key] for key in ("code", "exchange", "name", "selection")}
+                           for symbol in snapshot["members"] if (row := snapshot["stocks"].get(symbol))])
+
+
+def steady_live_bars(market, code, now):
+    key = _cache_key("steady_bars", code, now.date(), (now.hour, now.minute) >= (15, 5))
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    def quick_get(url, params, timeout):
+        return http_get(url, params=params, timeout=min(timeout, 3), retries=0)
+
+    bars = closed_bars(fetch_daily_bars(quick_get, market, code, 128), now) if is_a_stock(code, market) else []
+    source = "腾讯财经前复权日线"
+    if len(bars) < 120:
+        response, _ = quick_get(EM_KLINE_URL, {
+            "secid": f"{market}.{code}", "klt": 101, "fqt": 1, "lmt": 128, "end": "20500101",
+            "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55",
+        }, 3)
+        em_bars = []
+        for line in em_payload(response).get("klines") or ():
+            if not isinstance(line, str):
+                continue
+            fields = line.split(",")
+            if len(fields) >= 5:
+                day, opening, close, high, low = fields[:5]
+                em_bars.append({"date": day, "open": safe_float(opening), "close": safe_float(close),
+                                "high": safe_float(high), "low": safe_float(low)})
+        em_bars = closed_bars(em_bars, now)
+        if len(em_bars) > len(bars):
+            bars, source = em_bars, "东方财富前复权日线"
+    result = (bars, source)
+    if len(bars) >= 120:
+        _cache_set(key, result)
+    return result
+
+
+@app.route("/api/stock/<stock_code>/steady")
+def api_stock_steady(stock_code):
+    market, code = parse_stock_input(stock_code)
+    if market is None:
+        return jsonify(error="请输入有效的 A 股代码"), 400
+    if is_a_stock(code, market):
+        exchange = "sh" if market == 1 else "sz"
+    elif code.startswith(("43", "82", "83", "87", "88", "92")):
+        exchange, market = "bj", 0
+    else:
+        return jsonify(error="稳健派分析适用于 A 股"), 400
+
+    now = datetime.now(CHINA_TZ)
+    snapshot = steady_snapshot()
+    pool = pool_period(snapshot, now) if snapshot else None
+    entry = snapshot["stocks"].get(exchange + code, {}) if snapshot else {}
+    selection = entry.get("selection")
+    pool_day = pool["as_of"] if pool and not pool["stale"] and selection and selection["selected"] else None
+    archived = entry.get("archived")
+    bars, source = steady_live_bars(market, code, now)
+    if archived and (not bars or bars[-1]["date"] < archived["as_of"]
+                     or (archived["enough"] and len(bars) < 120)):
+        signal, source, archive = archived, "本地复权行情归档", True
+    else:
+        previous_session = None
+        if len(bars) >= 2:
+            latest, prior = bars[-1]["date"], bars[-2]["date"]
+            sessions = snapshot["sessions"] if snapshot else []
+            previous_session = verified_previous_session(sessions, prior, latest)
+        signal, archive = breakout_reading(bars, pool_day, previous_session), False
+    if signal:
+        # 计划写的是“下一交易日开盘”买入。那次开盘过去后（比如只能用旧的本地归档时）要标成已过期。
+        # 复制一份再加字段：归档读数来自带缓存的快照，不能改到缓存里的原对象。
+        signal = {**signal, "entry_passed": entry_open_passed(signal["as_of"], now)}
+    return jsonify(code=code, strategy=STEADY_RULE, pool=pool, selection=selection, signal=signal,
+                   archived=archive, source=source if signal else None)
 
 
 # ─── 我的持仓 ───
