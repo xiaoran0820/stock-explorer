@@ -661,6 +661,7 @@ async function selectStock(code, market, name, restorePeriod) {
     $('#stock-quote-status').textContent = '正在获取行情…';
     if (openingStock) header?.scrollIntoView({block:'start'});
     loadCommentary(code);
+    loadStockSteady(code);
     loadStockResearch(code);
     // Load chart based on period
     if (period === 'intraday') {
@@ -733,13 +734,16 @@ function initChart(domId) {
 }
 
 const indicatorPanels = {macd:'chart-indicator', kdj:'chart-indicator2', rsi:'chart-rsi'};
+const KLINE_LEFT = 0.08, KLINE_RIGHT = 0.03;
+const KLINE_GRID = {left:`${KLINE_LEFT * 100}%`, right:`${KLINE_RIGHT * 100}%`};
+const KLINE_MIN_SPAN = 3;
+let klineViewport;
+let removeKlineGestures;
 
 function disposeAllCharts() {
-    const dom = $('#chart-main');
-    if (dom._wheelHandler) {
-        dom.removeEventListener('wheel', dom._wheelHandler);
-        delete dom._wheelHandler;
-    }
+    removeKlineGestures?.();
+    removeKlineGestures = null;
+    $('#kline-gesture-hint').classList.add('hidden');
     Object.values(state.chartInstances).forEach(c => { if (!c.isDisposed()) c.dispose(); });
     state.chartInstances = {};
     Object.values(indicatorPanels).forEach(id => document.getElementById(id).classList.remove('show'));
@@ -747,6 +751,7 @@ function disposeAllCharts() {
 
 async function loadIntradayChart(code, market, name) {
     disposeAllCharts();
+    klineViewport = null;
     $('#chart-status').textContent = '正在加载分时…';
     $$('.ind-toggle').forEach(button => { button.disabled = true; });
     const chart = initChart('chart-main');
@@ -834,8 +839,165 @@ function volumeColor(price, reference) {
     return price > reference ? 'rgba(248,81,73,0.5)' : price < reference ? 'rgba(63,185,80,0.5)' : 'rgba(140,150,160,0.45)';
 }
 
+function bindKlineGestures(chart, viewport) {
+    const dom = chart.getDom();
+    const scroller = $('#chart-scroll');
+    const listeners = new AbortController();
+    const options = {capture:true, passive:false, signal:listeners.signal};
+    let frame = null;
+    let pending;
+    let lastPointer;
+    let gestureScale = null;
+    let gestureAnchor = 0.5;
+    let lastScrollLeft = 0;
+    let viewWidth = 0;
+
+    function plotWidth() {
+        return scroller.clientWidth * (1 - KLINE_LEFT - KLINE_RIGHT);
+    }
+
+    function anchorAt(event) {
+        const pointer = Number.isFinite(event.clientX) && Number.isFinite(event.clientY) ? event : lastPointer;
+        if (!pointer) return 0.5;
+        const rect = dom.getBoundingClientRect();
+        const fraction = (pointer.clientX - rect.left - scroller.clientWidth * KLINE_LEFT) / Math.max(1, plotWidth());
+        return Math.max(0, Math.min(1, fraction));
+    }
+
+    function syncScroll() {
+        const width = scroller.clientWidth;
+        if (!width) return;
+        if (viewWidth !== width) {
+            viewWidth = width;
+            scroller.style.setProperty('--kline-view-width', `${width}px`);
+            if (chart.getWidth() !== width) chart.resize({width});
+        }
+        const span = viewport.end - viewport.start;
+        const scrollDistance = Math.ceil(plotWidth() * (100 - span) / span);
+        scroller.style.setProperty('--kline-scroll-width', `${width + scrollDistance}px`);
+        const maxScroll = scroller.scrollWidth - scroller.clientWidth;
+        scroller.scrollLeft = span < 100 ? maxScroll * viewport.start / (100 - span) : 0;
+        lastScrollLeft = scroller.scrollLeft;
+    }
+
+    function updateRange(start, span, fromScroll = false) {
+        const nextStart = Math.max(0, Math.min(100 - span, start));
+        const end = nextStart + span;
+        const range = pending || viewport;
+        if (nextStart === range.start && end === range.end) return;
+        pending = {start:nextStart, end, fromScroll};
+        if (frame !== null) return;
+        frame = requestAnimationFrame(() => {
+            frame = null;
+            const next = pending;
+            pending = null;
+            if (!next || chart.isDisposed()) return;
+            const {start, end, fromScroll} = next;
+            Object.assign(viewport, {start, end});
+            chart.dispatchAction({type:'dataZoom', dataZoomId:'dzInside', start, end, animation:{duration:0}});
+            if (!fromScroll) syncScroll();
+        });
+    }
+
+    function zoomAt(anchor, factor) {
+        const range = pending || viewport;
+        const span = range.end - range.start;
+        const nextSpan = Math.max(KLINE_MIN_SPAN, Math.min(100, span * factor));
+        updateRange(range.start + (span - nextSpan) * anchor, nextSpan);
+    }
+
+    function syncRange(event) {
+        const range = event.batch?.[0] || event;
+        if (!Number.isFinite(range.start) || !Number.isFinite(range.end) ||
+            (range.start === viewport.start && range.end === viewport.end)) return;
+        Object.assign(viewport, {start:range.start, end:range.end});
+        pending = null;
+        syncScroll();
+    }
+
+    scroller.classList.add('kline-scroll');
+    scroller.tabIndex = 0;
+    scroller.setAttribute('role', 'region');
+    scroller.setAttribute('aria-label', 'K 线时间轴，可用左右方向键平移');
+    syncScroll();
+    const resize = new ResizeObserver(syncScroll);
+    resize.observe(scroller);
+    chart.on('datazoom', syncRange);
+
+    function panFromScroll() {
+        const maxScroll = scroller.scrollWidth - scroller.clientWidth;
+        const left = Math.max(0, Math.min(maxScroll, scroller.scrollLeft));
+        if (!maxScroll || Math.abs(left - lastScrollLeft) < 0.5) return;
+        lastScrollLeft = left;
+        const span = viewport.end - viewport.start;
+        updateRange(left / maxScroll * (100 - span), span, true);
+    }
+
+    function panBy(pixels) {
+        scroller.scrollLeft += pixels;
+        panFromScroll();
+    }
+
+    const passive = {passive:true, signal:listeners.signal};
+    scroller.addEventListener('scroll', panFromScroll, passive);
+    scroller.addEventListener('pointermove', event => { lastPointer = event; }, passive);
+    scroller.addEventListener('keydown', event => {
+        if (event.target !== scroller || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
+        event.preventDefault();
+        panBy((event.key === 'ArrowLeft' ? -1 : 1) * plotWidth() / 8);
+    }, options);
+    scroller.addEventListener('wheel', event => {
+        const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? plotWidth() : 1;
+        if (!event.ctrlKey && !event.metaKey) {
+            const horizontal = event.deltaX || -event.wheelDeltaX || 0;
+            if (event.cancelable && Math.abs(horizontal) > Math.abs(event.deltaY)) {
+                event.preventDefault();
+                panBy(horizontal * unit);
+            }
+            return;
+        }
+        if (!event.deltaY) return;
+        event.preventDefault();
+        if (gestureScale !== null) return;
+        const delta = Math.max(-160, Math.min(160, event.deltaY * unit));
+        zoomAt(anchorAt(event), Math.exp(delta / 250));
+    }, options);
+    // Safari reports trackpad pinch as a cumulative scale through WebKit gesture events.
+    scroller.addEventListener('gesturestart', event => {
+        gestureAnchor = anchorAt(event);
+        gestureScale = 1;
+        event.preventDefault();
+    }, options);
+    scroller.addEventListener('gesturechange', event => {
+        if (gestureScale === null || !Number.isFinite(event.scale) || event.scale <= 0) return;
+        event.preventDefault();
+        zoomAt(gestureAnchor, gestureScale / event.scale);
+        gestureScale = event.scale;
+    }, options);
+    scroller.addEventListener('gestureend', event => {
+        if (gestureScale === null) return;
+        gestureScale = null;
+        event.preventDefault();
+    }, options);
+
+    return () => {
+        listeners.abort();
+        resize.disconnect();
+        chart.off('datazoom', syncRange);
+        if (frame !== null) cancelAnimationFrame(frame);
+        scroller.classList.remove('kline-scroll');
+        scroller.removeAttribute('tabindex');
+        scroller.removeAttribute('role');
+        scroller.removeAttribute('aria-label');
+        scroller.style.removeProperty('--kline-view-width');
+        scroller.style.removeProperty('--kline-scroll-width');
+        scroller.scrollLeft = 0;
+    };
+}
+
 async function loadKlineChart(code, market, period) {
     disposeAllCharts();
+    if (klineViewport?.code !== code || klineViewport?.period !== period) klineViewport = null;
     $('#chart-status').textContent = '正在加载K线…';
     $$('.ind-toggle').forEach(button => { button.disabled = false; });
 
@@ -862,6 +1024,9 @@ async function loadKlineChart(code, market, period) {
             document.getElementById(id).classList.toggle('show', state.activeIndicators.has(key) && Boolean(result.indicators?.[key]));
         });
         const data = result.data;
+        const initialStart = Math.max(0, 100 - Math.min(80, 100 * 80 / data.length));
+        klineViewport ??= {code, period, start:initialStart, end:100};
+        const {start, end} = klineViewport;
         const mas = result.mas || {};
         const inds = result.indicators || {};
         const dates = data.map(d => d.date);
@@ -899,56 +1064,30 @@ async function loadKlineChart(code, market, period) {
 
         mainChart.setOption({
             backgroundColor: chartBg(),
+            animation:false,
             tooltip: {trigger:'axis',axisPointer:{type:'cross'},backgroundColor:chartBg(),
                 borderColor:chartBorder(),textStyle:{color:chartText(),fontSize:11}},
             legend: {top:0,left:'center',textStyle:{color:chartText(),fontSize:10},data:['K线','MA5','MA10','MA20','MA60']},
             dataZoom: [
                 {type:'inside', id:'dzInside', xAxisIndex:[0,1],
-                    start:Math.max(0,100-Math.min(80,100*80/Math.max(data.length,1))), end:100,
-                    minSpan:3, maxSpan:100,
+                    start, end, minSpan:KLINE_MIN_SPAN, maxSpan:100,
+                    throttle:0,
                     zoomOnMouseWheel:false,
                     moveOnMouseWheel:false,
                 },
                 {type:'slider', id:'dzSlider', xAxisIndex:[0,1],
-                    start:Math.max(0,100-Math.min(80,100*80/Math.max(data.length,1))), end:100,
-                    minSpan:3, maxSpan:100,
+                    start, end, minSpan:KLINE_MIN_SPAN, maxSpan:100,
+                    throttle:0,
                     bottom:2, height:16,
                     borderColor:chartBorder(), backgroundColor:chartBg(), textStyle:{color:chartText()}},
             ],
-            grid: [{left:'8%',right:'3%',top:'6%',height:'50%'},{left:'8%',right:'3%',top:'62%',height:'14%'}],
+            grid: [{...KLINE_GRID,top:'6%',height:'50%'},{...KLINE_GRID,top:'62%',height:'14%'}],
             xAxis: [{type:'category',data:dates,gridIndex:0,axisLabel:{color:chartText(),fontSize:10},axisLine:{lineStyle:{color:chartBorder()}}},
                     {type:'category',data:dates,gridIndex:1,axisLabel:{show:false},axisLine:{lineStyle:{color:chartBorder()}}}],
             yAxis: [{type:'value',gridIndex:0,scale:true,splitLine:{lineStyle:{color:chartGrid()}},axisLabel:{color:chartText(),fontSize:10}},
                     {type:'value',gridIndex:1,splitLine:{lineStyle:{color:chartGrid()}},axisLabel:{color:chartText(),fontSize:10}}],
             series: state.activeIndicators.has('vol') ? [...mainSeries, volSeries] : mainSeries,
         }, true);
-
-        // ── Manual wheel handler (more precise speed control) ──
-        const dom = mainChart.getDom();
-        if (dom._wheelHandler) dom.removeEventListener('wheel', dom._wheelHandler);
-        dom._wheelHandler = (e) => {
-            if (mainChart.isDisposed()) return;
-            const dzOpt = mainChart.getOption()?.dataZoom?.[0];
-            if (!dzOpt) return;
-            const span = dzOpt.end - dzOpt.start;
-            const center = (dzOpt.start + dzOpt.end) / 2;
-
-            if (e.ctrlKey || e.metaKey) {
-                // Zoom — slow 8% per tick
-                e.preventDefault();
-                const factor = e.deltaY > 0 ? 1.08 : 0.926;
-                const newSpan = Math.max(3, Math.min(100, span * factor));
-                const ns = Math.max(0, Math.min(100 - newSpan, center - newSpan / 2));
-                mainChart.dispatchAction({ type: 'dataZoom', start: ns, end: ns + newSpan });
-            } else if (Math.abs(e.deltaX) > 0) {
-                // Horizontal pan — move 2% of visible span per scroll tick
-                e.preventDefault();
-                const shift = (e.deltaX > 0 ? 1 : -1) * Math.max(0.5, span * 0.02);
-                const ns = Math.max(0, Math.min(100 - span, dzOpt.start + shift));
-                mainChart.dispatchAction({ type: 'dataZoom', start: ns, end: ns + span });
-            }
-        };
-        dom.addEventListener('wheel', dom._wheelHandler, { passive: false });
 
         // ── MACD ──
         if (state.activeIndicators.has('macd') && inds.macd) {
@@ -1018,6 +1157,8 @@ async function loadKlineChart(code, market, period) {
         }
 
         mainChart.resize();
+        removeKlineGestures = bindKlineGestures(mainChart, klineViewport);
+        $('#kline-gesture-hint').classList.remove('hidden');
     } catch(e) {
         if (mainChart.isDisposed()) return;
         $('#chart-status').innerHTML = dataState('K线行情暂不可用', 'chart');
@@ -1530,11 +1671,115 @@ function pickChangeClass(value) {
     return value > 0 ? 'st-change-up' : value < 0 ? 'st-change-down' : '';
 }
 
+const steadyPct = value => Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : '—';
+const steadyPrice = value => Number.isFinite(value) ? value.toFixed(2) : '—';
+
+async function loadSteadyPool() {
+    const status = $('#steady-pool-status');
+    const details = $('#steady-pool-details');
+    const badge = $('#steady-pool-badge');
+    status.textContent = '正在读取月度名单…';
+    try {
+        const data = await (await requestAPI('/api/steady/pool')).json();
+        badge.textContent = data.stale ? '历史名单' : `${data.stocks.length} 只候选`;
+        status.textContent = `${data.active_month} 名单 · ${data.as_of} 收盘筛选 · `
+            + `股息率门槛 ${steadyPct(data.yield_floor)}${data.stale ? ' · 最新月度数据待更新' : ''}`;
+        $('#steady-pool-body').innerHTML = data.stocks.map(stock => {
+            const {selection} = stock;
+            return `<tr><td>${selection.rank}</td><td><button type="button" class="steady-stock-link" data-steady-code="${escapeHTML(stock.code)}" data-steady-name="${escapeHTML(stock.name)}">${escapeHTML(stock.name)} <small>${escapeHTML(stock.code)}</small></button></td><td>${steadyPct(selection.yield)}</td><td>${steadyPct(selection.volatility)}</td></tr>`;
+        }).join('');
+        details.classList.remove('hidden');
+    } catch {
+        badge.textContent = '暂不可用';
+        details.classList.add('hidden');
+        status.innerHTML = dataState('月度股票池暂不可用', 'steady-pool');
+    }
+}
+
+let steadyRequest = 0;
+async function loadStockSteady(code) {
+    const id = ++steadyRequest;
+    const badge = $('#stock-steady-badge');
+    const status = $('#stock-steady-status');
+    const body = $('#stock-steady-body');
+    $('#stock-steady').classList.remove('hidden');
+    badge.textContent = '分析中';
+    status.textContent = '正在核对月度候选与已收盘日线…';
+    body.innerHTML = '';
+    try {
+        const data = await (await requestAPI(`/api/stock/${encodeURIComponent(code)}/steady`)).json();
+        if (id !== steadyRequest || state.currentStock?.code !== code) return;
+        renderStockSteady(data, badge, status, body);
+    } catch {
+        if (id !== steadyRequest || state.currentStock?.code !== code) return;
+        badge.textContent = '暂不可用';
+        status.innerHTML = dataState('稳健派分析暂不可用', 'stock-steady');
+    }
+}
+
+function renderStockSteady({pool, selection, signal, archived, source, strategy}, badge, status, body) {
+    const candidate = selection?.selected;
+    badge.textContent = !selection ? '无筛选记录' : pool.stale ? '历史名单' : candidate ? '已入池' : '未入池';
+    status.textContent = [pool ? `候选名单 ${pool.active_month} · ${pool.as_of} 收盘筛选` : '月度名单暂不可用',
+        signal ? `行情截至 ${signal.as_of} 收盘 · ${source}` : '前复权日线暂不可用'].join(' ｜ ');
+    const metrics = (rows) => `<div class="research-metrics">${rows.map(([label, value]) =>
+        `<div class="research-metric"><span>${escapeHTML(label)}</span><strong>${escapeHTML(value)}</strong></div>`
+    ).join('')}</div>`;
+    let selectionHTML = '<p class="research-help">该股票在此期名单没有可用的筛选记录。</p>';
+    if (selection) {
+        const reasons = [];
+        if (!selection.priced) reasons.push('筛选日缺少有效收盘价');
+        if (selection.years < 3) reasons.push('过去三个滚动年度未全部实施现金分红');
+        if (selection.turnover == null || selection.turnover < pool.turnover_floor) reasons.push('近 20 日成交额中位数未达到门槛');
+        if (!selection.volatility) reasons.push('日线样本不足以进行有效低波排名');
+        if (selection.eligible && selection.yield < pool.yield_floor) reasons.push('股息率低于合格股票的中位数');
+        if (selection.rank && !candidate) reasons.push(`高股息组低波排名第 ${selection.rank}，候选取前 50`);
+        if (candidate) reasons.push(`通过分红和流动性门槛，高股息组低波排名第 ${selection.rank}`);
+        selectionHTML = metrics([
+            ['有现金分红的年度', `${selection.years} / 3`], ['近一年股息率', steadyPct(selection.yield)],
+            ['年化波动率', steadyPct(selection.volatility)], ['近 20 日成交额中位数', formatAmt(selection.turnover)],
+        ]) + `<p class="research-help">${escapeHTML(reasons.join(' · '))}</p>`;
+    }
+
+    let tradeHTML = signal ? '<p class="research-help">已收盘日线不足 120 根，暂不能计算突破条件。</p>'
+        : dataState('前复权日线暂不可用', 'stock-steady');
+    if (signal?.enough) {
+        const allowed = candidate && !pool.stale && signal.as_of >= pool.as_of;
+        const checks = [['收盘在 100 日线上方', signal.above_ma], ['100 日线较 20 日前上升', signal.rising_ma],
+            ['收盘突破此前 55 日高点', signal.breakout]];
+        let plan = `<p>${signal.setup ? '技术突破条件成立，当前名单未确认可入场。' : '尚未同时满足三项突破条件。'}</p>`;
+        if (signal.setup && allowed && signal.entry_passed) {
+            // 下一交易日已经开过盘：不能再把这个计划当成还能照做的买入条件
+            plan = `<p>${escapeHTML(signal.as_of)} 收盘时突破条件成立，按规则应在下一交易日开盘买入；那次开盘已经过去，这个入场计划已过期。</p>
+               <p>${archived ? '实时行情暂不可用，以上是本地归档数据，行情恢复后会显示最新信号。' : '收盘后会按最新日线更新。'}</p>`;
+        } else if (signal.setup && allowed) {
+            plan = `<p>${archived ? '归档交易计划' : '突破条件成立'}。次一交易日开盘须高于 ${steadyPrice(signal.stop)} 元，且不超过 ${steadyPrice(signal.max_open)} 元。</p>
+               <p>参考止损 ${steadyPrice(signal.stop)} 元，按信号日收盘估算 1R 止盈 ${steadyPrice(signal.indicative_target)} 元。实际目标按成交价重新计算。</p>`;
+        }
+        const previous = allowed && signal.previous_plan;
+        let previousHTML = '';
+        if (previous) {
+            const details = previous.filled
+                ? `开盘 ${steadyPrice(previous.opening)} 元符合模拟入场条件，止损 ${steadyPrice(previous.stop)} 元，1R 目标 ${steadyPrice(previous.target)} 元。`
+                : '开盘价或当日可交易条件未满足，计划跳过。';
+            previousHTML = `<p>${escapeHTML(previous.entry_day)} 开盘回看 · ${details}${previous.stop_due ? ' 入场日收盘跌破止损，模型等下一可交易日开盘退出。' : ''}</p>`;
+        }
+        tradeHTML = metrics([['最新收盘', steadyPrice(signal.close)], ['100 日均线', steadyPrice(signal.ma_100)],
+            ['此前 55 日最高', steadyPrice(signal.high_55)], ['近 10 日最低', steadyPrice(signal.stop)]])
+            + `<ul class="steady-checks">${checks.map(([label, met]) => `<li><strong>${met ? '满足' : '未满足'}</strong> · ${label}</li>`).join('')}</ul>`
+            + `<div class="steady-plan">${plan}${previousHTML}</div>`;
+    }
+    body.innerHTML = `<div class="steady-section"><h4>入池依据</h4>${selectionHTML}</div>
+        <div class="steady-section"><h4>${escapeHTML(strategy)} 交易条件</h4>${tradeHTML}
+            <p class="panel-footnote">模型买入当天不卖出。成交后的固定止盈位是成交价加上成交价到初始止损的距离，触及止盈或止损时退出。</p></div>`;
+}
+
 function switchToPicks(topic, options) {
     $$('.mtab').forEach(b => b.classList.toggle('active', b.dataset.view === 'picks'));
     $$('.view').forEach(v => v.classList.remove('active'));
     $('#view-picks').classList.add('active');
     $('#picks-topic-input').value = topic || '';
+    loadSteadyPool();
     loadHoldings();
     loadPicks(options);
 }
@@ -1850,6 +2095,10 @@ function initNavigation() {
     bindStockResearch();
     bindPicks();
     bindHoldings();
+    $('#steady-pool-body').addEventListener('click', event => {
+        const button = event.target.closest('[data-steady-code]');
+        if (button) selectStock(button.dataset.steadyCode, stockMarket(button.dataset.steadyCode), button.dataset.steadyName, 'daily');
+    });
     document.addEventListener('click', e => {
         const retry = e.target.closest('[data-retry]');
         if (!retry) return;
@@ -1857,6 +2106,7 @@ function initNavigation() {
             research:() => state.currentStock && loadStockResearch(state.currentStock.code),
             constituents:() => state.selectedIndex && loadConstituents(state.selectedIndex.code, state.selectedIndex.name),
             topic:searchTopic, picks:() => loadPicks({revealResults: true}), holdings:loadHoldings, 'stock-info':() => state.currentStock && loadStockInfo(state.currentStock.code, state.currentStock.market),
+            'steady-pool':loadSteadyPool, 'stock-steady':() => state.currentStock && loadStockSteady(state.currentStock.code),
             chart:() => {
                 const stock = state.currentStock;
                 if (!stock) return;
@@ -1891,7 +2141,7 @@ function initNavigation() {
             else if (viewId === 'stock-detail' && state.currentStock) setHash('stock', state.currentStock.code);
 
             // First visit (or after a failed load): backtest the current hot topics
-            if (viewId === 'picks') loadHoldings();
+            if (viewId === 'picks') { loadHoldings(); loadSteadyPool(); }
             if (viewId === 'picks' && !picksState.loaded && $('#picks-loading').classList.contains('hidden')) loadPicks();
 
             // Load discover default on first visit
