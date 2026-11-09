@@ -231,6 +231,40 @@ class MarketTests(unittest.TestCase):
             self.assertEqual(first.result()["summary"], second.result()["summary"])
             self.assertEqual(provider.call_count, 1)
 
+    def test_eastmoney_fallback_keeps_quote_range_fields(self):
+        # 新浪失败时只剩东方财富；之前漏请求了开盘/最高/最低/昨收/振幅，个股速读会因 None 比较报错
+        stamp = datetime(2026, 11, 9, 15, 0, tzinfo=market.CHINA_TZ).timestamp()
+        full = {'f57': '600519', 'f58': '贵州茅台', 'f43': 1440.06, 'f44': 1449.99, 'f45': 1435.08,
+                'f46': 1442.0, 'f60': 1438.0, 'f169': 2.06, 'f170': 0.14, 'f171': 1.04, 'f124': stamp}
+
+        def fake_get(url, params=None, headers=None, timeout=8):
+            if 'sinajs' in url:
+                return None, 'offline'
+            response = Mock()
+            response.json.return_value = {'rc': 0, 'data': {f: full[f] for f in params['fields'].split(',') if f in full}}
+            return response, None
+
+        with patch.object(market, 'http_get', side_effect=fake_get):
+            info = market.get_stock_info(1, '600519')
+        self.assertEqual((info['open'], info['high'], info['low'], info['preclose']), (1442.0, 1449.99, 1435.08, 1438.0))
+        self.assertEqual(info['quote_time'], '2026-11-09 15:00:00')
+        reading = market.make_stock_reading(info, [])
+        self.assertIn('当日区间', [point['label'] for point in reading['points']])
+
+    def test_reading_tolerates_missing_fields(self):
+        info = dict(name='测试', price=10.0, change_pct=None, high=None, low=None, amplitude=None, quote_time='')
+        self.assertEqual(market.make_stock_reading(info, [])['mode'], 'rules')
+
+    def test_http_get_retries_dropped_connection_but_not_timeout(self):
+        ok = Mock()
+        with patch.object(market.requests, 'get', side_effect=[market.requests.ConnectionError('dropped'), ok]) as get, \
+             patch.object(market.time, 'sleep'):
+            self.assertIs(market.http_get('https://example.com')[0], ok)
+        self.assertEqual(get.call_count, 2)
+        with patch.object(market.requests, 'get', side_effect=market.requests.Timeout('slow')) as get:
+            self.assertIsNone(market.http_get('https://example.com')[0])
+        self.assertEqual(get.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()
