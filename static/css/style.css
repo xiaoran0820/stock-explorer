@@ -351,6 +351,14 @@ button,input {font:inherit}
 button,a,input { -webkit-tap-highlight-color:transparent }
 button:focus-visible,a:focus-visible,input:focus-visible,[tabindex]:focus-visible {outline:2px solid var(--blue);outline-offset:4px}
 button:disabled {cursor:wait;opacity:.5}
+.text-btn:disabled {cursor:default}
+.action-feedback {position:fixed;right:16px;bottom:58px;z-index:150;max-width:calc(100% - 32px);padding:10px 14px;border:1px solid var(--border2);border-radius:8px;background:var(--bg3);color:var(--tx);box-shadow:var(--shadow);font-size:12px;pointer-events:none}
+.action-feedback:empty {opacity:0}
+.icon-btn[aria-busy="true"] .icon {animation:spin .8s linear infinite}
+.search-btn[aria-busy="true"]::before {content:"";display:inline-block;width:11px;height:11px;margin-right:6px;border:2px solid transparent;border-top-color:currentColor;border-right-color:currentColor;border-radius:50%;vertical-align:-1px;animation:spin .8s linear infinite}
+.stock-empty-search {position:relative;max-width:400px;margin:16px auto}
+.search-feedback {padding:10px 12px;color:var(--tx2);font-size:11px;text-align:left}
+#constituents-panel,#stock-detail-header {scroll-margin-top:100px}
 button {color:inherit}
 a:hover {color:var(--blue)}
 .icon-sprite {position:absolute;width:0;height:0;overflow:hidden}
@@ -382,7 +390,7 @@ a:hover {color:var(--blue)}
 .wl-strip-empty {font-size:11px;color:var(--tx3)}
 .wl-strip-mini {padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg2)}
 .wl-strip-mini .wls-name {max-width:80px}
-.wl-strip-mini .wls-remove {visibility:visible;font-size:10px}
+.wl-strip-mini .wls-remove {visibility:visible;font-size:10px;border:0;background:none}
 .text-btn {background:none;border:0;color:var(--tx3);font-size:11px;padding:5px}
 .text-btn:hover {color:var(--blue)}
 .app-layout {max-width:1600px;padding:28px 36px 44px;gap:28px;align-items:flex-start;min-height:calc(100vh - 230px)}
@@ -516,6 +524,7 @@ a:hover {color:var(--blue)}
  .sidebar .wl-item {padding:12px 8px}.index-cards {grid-template-columns:repeat(4,minmax(0,1fr))}.sidebar-header h3 {margin-top:3px}.sidebar-footer {padding:9px 18px}
 }
 @media(max-width:720px) {
+ #constituents-panel,#stock-detail-header {scroll-margin-top:128px}
  .top-bar-inner {min-height:116px;flex-wrap:wrap;padding:16px 18px 0;gap:14px}.logo {font-size:20px}.brand-mark {width:33px;height:33px}.main-tabs {order:4;width:100%;height:42px;justify-content:space-around;gap:0}.mtab {font-size:12px;padding:0 10px}.global-search {flex:1;max-width:240px;padding:8px;gap:6px}.global-search kbd {display:none}.top-actions {margin-left:auto}.top-actions #btn-density-toggle {display:none}.icon-btn {min-width:28px;height:28px}
  .wl-strip {margin:0 18px;gap:8px;flex-wrap:wrap;padding:12px 0}.wl-strip-header {width:100%;gap:10px}.wl-strip-search-wrapper {flex:1}.wl-strip-search {width:100%;max-width:230px}.wl-strip-items {width:100%;flex:auto;min-height:22px}.wl-strip-empty {font-size:10px}
  .app-layout {padding:24px 18px;gap:18px}.overview-heading {margin-bottom:24px;align-items:flex-start;gap:8px}.overview-heading h2,.view-heading h2 {font-size:27px}.overview-heading .eyebrow {font-size:8px;letter-spacing:1px}.overview-heading p {font-size:10px}.session-box {padding-top:4px;gap:8px}.market-time,#market-date {font-size:9px}.market-time::before {display:none}.section-heading {margin-bottom:14px}.section-heading h3 {font-size:14px}.muted {font-size:9px;max-width:160px}
@@ -556,3 +565,98 @@ a:hover {color:var(--blue)}
 .sort-button:hover {color:var(--blue)}
 #chart-status {border-top:0;margin:0;padding:0 8px 6px}
 #constituents-meta {border-top:0;margin:0 0 12px;padding:0}
+
+/* Company research and source timeline */
+.stock-research {margin-top:20px;scroll-margin-top:100px;min-width:0}
+.research-jump,.research-chip {border:1px solid var(--border2);border-radius:7px;background:var(--bg3);color:var(--tx2);font:inherit;font-size:11px;padding:6px 9px;cursor:pointer}
+.research-jump {margin-left:auto;color:var(--blue);white-space:nowrap}
+.research-chip:hover,.research-jump:hover,.research-chip[aria-pressed="true"] {border-color:var(--blue);color:var(--blue)}
+.research-heading h3 {margin:4px 0 0}
+.research-form {display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:12px;padding:14px;border:1px solid var(--border);border-radius:10px;background:var(--bg2)}
+.research-presets,.research-date-fields,.research-links {display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+.research-date-fields {align-items:flex-end}
+.research-date-fields label {display:grid;gap:5px;color:var(--tx3);font-size:11px;min-width:0}
+.research-date-fields input {min-width:0;max-width:100%;border:1px solid var(--border2);border-radius:6px;padding:6px 8px;background:var(--bg3);color:var(--tx);font:inherit;min-height:32px}
+.research-date-fields button {min-height:32px}
+.research-help,.research-status {font-size:11px;color:var(--tx3);line-height:1.7;margin:8px 0}
+.research-status:empty {display:none}
+.research-version {border-left:2px solid var(--blue);padding-left:8px;color:var(--tx2)}
+.research-company,.research-block {padding-top:17px;margin-top:17px;border-top:1px solid var(--border)}
+.research-company p,.research-insight p {font-size:12px;line-height:1.75;color:var(--tx2);margin:7px 0;overflow-wrap:anywhere}
+.research-links {font-size:11px;margin-top:8px}
+.research-links a,.research-event a {color:var(--blue);text-decoration:none}
+.research-links a:hover,.research-event a:hover {text-decoration:underline}
+.research-metrics,.research-insight-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+.research-insight-grid {grid-template-columns:repeat(3,minmax(0,1fr))}
+.research-metric,.research-insight {min-width:0;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg2)}
+.research-metric span,.research-metric small {display:block;font-size:10px;color:var(--tx3)}
+.research-metric strong {display:block;font-size:16px;line-height:1.6;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.research-metric small.st-change-up {color:var(--red)}
+.research-metric small.st-change-down {color:var(--green)}
+.research-history {font-size:11px;margin:11px 0 0;color:var(--tx2)}
+.research-history summary {cursor:pointer;margin-bottom:8px}
+.research-timeline-heading {flex-wrap:wrap;gap:7px}
+.research-event {display:grid;grid-template-columns:90px minmax(0,1fr);align-items:start;gap:9px;padding:10px 0;border-bottom:1px solid var(--border)}
+.research-event time,.research-event-meta {font-size:10px;color:var(--tx3);font-variant-numeric:tabular-nums}
+.research-event-meta {display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin:0 0 4px}
+.research-event a {font-size:12px;overflow-wrap:anywhere}
+.research-more {margin-top:12px}
+@media (max-width:720px) {
+ .stock-research {scroll-margin-top:128px}
+ .research-form {padding:10px}
+ .research-date-fields {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}
+ .research-date-fields button {grid-column:1/-1}
+ .research-metrics {grid-template-columns:repeat(2,minmax(0,1fr))}
+ .research-insight-grid {grid-template-columns:1fr}
+ .research-event {grid-template-columns:1fr;gap:3px}
+}
+
+/* Backtest picks — 回测选股 */
+.picks-submit {display:inline-flex;align-items:center;justify-content:center;gap:6px;min-inline-size:108px;white-space:nowrap}
+.picks-submit:disabled {cursor:wait;filter:none}
+.picks-submit-spinner {display:none;width:12px;height:12px;border:2px solid transparent;border-top-color:currentColor;border-right-color:currentColor;border-radius:50%;animation:spin .7s linear infinite}
+.picks-submit:disabled .picks-submit-spinner {display:block}
+#picks-results {scroll-margin-top:100px}
+.picks-controls {display:flex;flex-wrap:wrap;align-items:center;gap:10px 22px;margin:0 0 6px}
+.picks-label {font-size:11px;color:var(--tx3);margin-right:2px}
+.picks-summary {font-size:12px;color:var(--tx2);margin:0 0 12px}
+.picks-summary strong {color:var(--tx);font-weight:600}
+#picks-topics {margin-bottom:12px}
+#picks-topics .concept-tag {font:inherit;font-size:12px;cursor:pointer}
+#picks-topics .concept-tag:hover {border-color:var(--purple)}
+.picks-table td small {display:block;margin-top:2px;font-size:10px;color:var(--tx3)}
+.picks-table .pick-rank {color:var(--tx3)}
+.pick-name {font-weight:550}
+.pick-badge {display:inline-block;margin-left:6px;padding:0 5px;border-radius:4px;font-size:10px;line-height:16px;color:var(--red);background:var(--red-bg);vertical-align:1px}
+.pick-topic {max-width:160px;overflow:hidden;text-overflow:ellipsis;color:var(--purple)}
+.pick-row-picked td:first-child {box-shadow:inset 3px 0 0 var(--red)}
+.pick-signal {display:inline-block;padding:1px 7px;border-radius:5px;font-size:11px;border:1px solid var(--border2);color:var(--tx3)}
+.pick-signal-buy {color:var(--red);background:var(--red-bg);border-color:transparent}
+.pick-signal-hold {color:var(--red);border-color:var(--red)}
+.pick-signal-sell {color:var(--green);background:var(--green-bg);border-color:transparent}
+.topic-stocks-heading {margin-bottom:8px}
+.topic-stocks-heading .section-title {margin:0}
+@media (max-width:720px) {
+ .picks-submit {min-inline-size:86px}
+ #picks-results {scroll-margin-top:128px}
+ .picks-controls {gap:8px 14px}
+ .pick-topic {max-width:110px}
+}
+
+/* My holdings — 我的持仓 */
+.holdings-panel {margin:14px 0 22px}
+.holding-form {display:grid;grid-template-columns:minmax(0,1.6fr) repeat(3,minmax(0,1fr)) auto;gap:10px;align-items:end;margin:8px 0 4px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg3)}
+.holding-form label {position:relative;display:grid;gap:5px;min-width:0;color:var(--tx3);font-size:11px}
+.holding-form input {min-width:0;min-height:34px;padding:6px 9px;border:1px solid var(--border2);border-radius:6px;background:var(--bg2);color:var(--tx);font:inherit;font-size:12px}
+.holding-form input:focus {outline:none;border-color:var(--blue)}
+.holding-form .search-btn {min-height:34px;white-space:nowrap}
+.holding-form .suggestions {z-index:60}
+#holdings-list {margin-top:10px}
+.holdings-table td small {display:block;margin-top:2px;font-size:10px;color:var(--tx3)}
+.holding-remove {color:var(--tx3)}
+.holding-remove:hover {color:var(--red)}
+.pick-badge-held {color:var(--blue);background:var(--blue-bg)}
+@media (max-width:720px) {
+ .holding-form {grid-template-columns:repeat(2,minmax(0,1fr))}
+ .holding-form .holding-stock,.holding-form .search-btn {grid-column:1/-1}
+}
