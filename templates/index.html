@@ -176,7 +176,24 @@
 
         <!-- ═══════════ 回测选股视图 ═══════════ -->
         <div id="view-picks" class="view">
-            <div class="view-heading"><span class="eyebrow">BACKTEST PICKS</span><h2>回测选股<span class="heading-dot">.</span></h2><p>用历史行情检验买卖规则，从热点话题里找出回测表现好、现在规则仍然看多的股票。</p></div>
+            <div class="view-heading"><span class="eyebrow">BACKTEST PICKS</span><h2>回测选股<span class="heading-dot">.</span></h2><p>查看稳健派的月度候选股，或用历史行情检验热点话题的买卖规则。</p></div>
+            <section id="steady-pool" class="surface steady-panel" aria-labelledby="steady-pool-title">
+                <div class="section-heading">
+                    <div><span class="eyebrow">DIVIDEND &amp; LOW VOLATILITY</span><h3 id="steady-pool-title">稳健派 · 红利低波</h3></div>
+                    <span class="small-badge" id="steady-pool-badge">月度候选</span>
+                </div>
+                <p class="research-help">筛选连续现金分红、成交活跃的股票，在股息率较高的一半中选出波动最低的 50 只。点开个股可查看 55 日突破交易计划。</p>
+                <div id="steady-pool-status" class="research-status" role="status">正在读取月度名单…</div>
+                <details id="steady-pool-details" class="steady-pool-details hidden">
+                    <summary>查看全部候选股</summary>
+                    <div class="stock-table-wrap">
+                        <table class="stock-table">
+                            <thead><tr><th>低波排名</th><th>股票</th><th>近一年股息率</th><th>年化波动率</th></tr></thead>
+                            <tbody id="steady-pool-body"></tbody>
+                        </table>
+                    </div>
+                </details>
+            </section>
             <form id="picks-form" class="search-box topic-search-box">
                 <input type="text" id="picks-topic-input" class="search-input" aria-label="回测话题"
                        placeholder="输入话题，如：固态电池；留空则使用当前热点话题" autocomplete="off">
@@ -273,6 +290,14 @@
                 <div id="commentary-body" class="commentary-body">正在分析行情与近期走势…</div>
                 <div class="commentary-footer"><span id="commentary-meta"></span><span>仅供研究参考</span></div>
             </section>
+            <section id="stock-steady" class="surface steady-panel hidden" aria-labelledby="stock-steady-title">
+                <div class="section-heading">
+                    <div><span class="eyebrow">DIVIDEND &amp; LOW VOLATILITY</span><h3 id="stock-steady-title">稳健派分析</h3></div>
+                    <span id="stock-steady-badge" class="small-badge">分析中</span>
+                </div>
+                <p id="stock-steady-status" class="research-status" role="status"></p>
+                <div id="stock-steady-body"></div>
+            </section>
             <!-- 图表周期切换 -->
             <div id="chart-period-tabs" class="chart-period-tabs hidden">
                 <button class="cptab active" data-period="intraday">分时</button>
@@ -290,7 +315,14 @@
             <!-- 图表区域 -->
             <div id="chart-wrap" class="chart-wrap hidden">
                 <div id="chart-status" class="panel-footnote" aria-live="polite"></div>
-                <div class="chart-main" id="chart-main"></div>
+                <p id="kline-gesture-hint" class="panel-footnote hidden">触控板：双指横滑平移 · 捏合缩放 · 竖滑浏览页面</p>
+                <div id="chart-scroll">
+                    <div class="chart-track">
+                        <div class="chart-viewport">
+                            <div class="chart-main" id="chart-main"></div>
+                        </div>
+                    </div>
+                </div>
                 <div class="chart-indicator" id="chart-indicator"></div>
                 <div class="chart-indicator2" id="chart-indicator2"></div>
                 <div class="chart-indicator" id="chart-rsi"></div>
