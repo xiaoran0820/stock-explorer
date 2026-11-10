@@ -28,7 +28,10 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from flask import Flask, jsonify, render_template, request
 from company_research import CNINFO_QUERY, collect_research, parse_window
-from backtest_picker import BUY_COST, SELL_COST, STRATEGIES, WINDOWS, fetch_daily_bars, latest_signals, load_bars, pick_stocks
+from backtest_picker import (
+    BUY_COST, SELL_COST, STRATEGIES, WINDOWS, bars_source_label, beijing_stock, factors_cache_key, fetch_qfq_factors,
+    fetch_tencent_bars, forward_adjust, latest_signals, load_bars, pick_stocks, positive_bars,
+)
 from holdings import HoldingFileError, HoldingStore, parse_holding
 from steady_strategy import (
     STRATEGY as STEADY_RULE, breakout_reading, closed_bars, entry_open_passed, pool_period, read_snapshot,
@@ -77,7 +80,7 @@ CACHE_TTL = {"concepts": 3600, "concept_stocks": 1800, "kline": 120, "intraday":
              "search": 300, "info": 30, "index": 30, "popular": 30, "index_members": 21600, "index_stocks": 60, "news": 300,
              "research_directory": 21600, "research_profile": 21600, "research_financial": 1800,
              "research_disclosures": 900, "research_media": 900, "research_sina": 300,
-             "pick_kline": 1800, "picks": 600, "steady_bars": 300}
+             "pick_kline": 1800, "picks": 600, "steady_bars": 300, "qfq_factors": 21600}
 MAX_CACHE = 500
 
 def _cache_key(*parts): return ":".join(str(p) for p in parts)
@@ -1333,13 +1336,12 @@ def run_picks(scope, query, window):
         # 区分"话题确实没有相关股票"和"板块数据源暂时取不到"，避免误导
         raise SourceUnavailable("没有找到和这个话题相关的沪深 A 股" if status == "ok"
                                 else "板块成分股暂时取不到（行情源繁忙），请稍后重试")
-    # 腾讯前复权数据取不到时，退回到个股图表使用的新浪日线（不复权）
+    # 腾讯日线取不到时，退回到个股图表使用的新浪日线；两者都是不复权价，再按新浪复权因子等比前复权
     rows, failed, skipped = pick_stocks(http_get, _cache_get, _cache_set, stocks, window, fallback=daily_bars_fallback)
     if not rows and failed:
         raise SourceUnavailable("历史行情暂不可用，请稍后重试")
     unadjusted = sum(not row["adjusted"] for row in rows)
-    source = ("腾讯财经前复权日线" if not unadjusted else "新浪财经不复权日线（腾讯行情暂不可用）"
-              if unadjusted == len(rows) else f"腾讯财经前复权日线；{unadjusted} 只改用新浪不复权日线")
+    source = bars_source_label(rows)
     result = {"scope": scope, "query": query if scope == "topic" else "", "window": window,
               "window_label": WINDOWS[window][1], "window_days": WINDOWS[window][0],
               "topics": topics, "stocks": rows, "failed": failed, "skipped": skipped,
@@ -1395,11 +1397,11 @@ def steady_live_bars(market, code, now):
     def quick_get(url, params, timeout):
         return http_get(url, params=params, timeout=min(timeout, 3), retries=0)
 
-    bars = closed_bars(fetch_daily_bars(quick_get, market, code, 128), now) if is_a_stock(code, market) else []
-    source = "腾讯财经前复权日线"
+    bars = closed_bars(fetch_tencent_bars(quick_get, market, code, 128), now) if is_a_stock(code, market) else []
+    source = "腾讯财经日线"
     if len(bars) < 120:
         response, _ = quick_get(EM_KLINE_URL, {
-            "secid": f"{market}.{code}", "klt": 101, "fqt": 1, "lmt": 128, "end": "20500101",
+            "secid": f"{market}.{code}", "klt": 101, "fqt": 0, "lmt": 128, "end": "20500101",
             "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55",
         }, 3)
         em_bars = []
@@ -1411,9 +1413,20 @@ def steady_live_bars(market, code, now):
                 day, opening, close, high, low = fields[:5]
                 em_bars.append({"date": day, "open": safe_float(opening), "close": safe_float(close),
                                 "high": safe_float(high), "low": safe_float(low)})
-        em_bars = closed_bars(em_bars, now)
+        em_bars = closed_bars(positive_bars(em_bars), now)
         if len(em_bars) > len(bars):
-            bars, source = em_bars, "东方财富前复权日线"
+            bars, source = em_bars, "东方财富日线"
+    # 两个来源都是不复权价，统一按新浪复权因子等比前复权。取不到因子时不用这些日线：
+    # 红利股几乎每半年除权一次，不复权价会让均线、55 日高点和止损都算错，改用本地归档或提示暂不可用。
+    adjusted = None
+    if bars:
+        factors_key = factors_cache_key(code, bars[-1]["date"])
+        factors = _cache_get(factors_key)
+        if factors is None:
+            factors = fetch_qfq_factors(quick_get, market, code)
+            _cache_set(factors_key, factors)  # 空列表不会写进缓存，下次重新取
+        adjusted = forward_adjust(bars, factors)
+    bars, source = (adjusted, source + "，按新浪复权因子等比前复权") if adjusted else ([], None)
     result = (bars, source)
     if len(bars) >= 120:
         _cache_set(key, result)
@@ -1427,7 +1440,7 @@ def api_stock_steady(stock_code):
         return jsonify(error="请输入有效的 A 股代码"), 400
     if is_a_stock(code, market):
         exchange = "sh" if market == 1 else "sz"
-    elif code.startswith(("43", "82", "83", "87", "88", "92")):
+    elif beijing_stock(code):
         exchange, market = "bj", 0
     else:
         return jsonify(error="稳健派分析适用于 A 股"), 400
