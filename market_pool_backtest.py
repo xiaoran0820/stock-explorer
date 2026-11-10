@@ -1,8 +1,16 @@
 """Replay the 55-day breakout / 1R trade across historical candidate pools.
 
-Each pool also reports buy_and_hold: the same pool held at equal weight with no
-entry or exit rules, the baseline the trading rule has to beat.
+Each pool also gets three baselines with no entry or exit rules, which the
+trading rule has to beat:
+- buy_and_hold: the whole pool at equal weight, fully invested;
+- slot_hold: at most SLOTS names of the pool at 1/SLOTS each, filled in the
+  turnover order the rule uses, so concentration matches the rule;
+- exposure_hold: the whole pool at equal weight with only the rule's average
+  exposure invested and the rest in cash, so the cash cushion matches the rule.
 
+Every window runs under the ideal and the conservative fill rules described in
+execution.py; each conservative run also reports versus_ideal, how its closed
+trades differ from the ideal run with the same window, pool and slippage.
 Requires NumPy. By default the runner reads the verified local data in
 .cache/market-data. Run python3 market_pool_backtest.py to reproduce the report.
 """
@@ -22,15 +30,21 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from backtest_picker import BUY_COST, SELL_COST
-from brooks_backtest import exit_order, stats
+from backtest_picker import BEIJING_PREFIXES
+from brooks_backtest import record_open, stats
+from execution import (ACCOUNT, CHINEXT_WIDER_LIMIT, CONSERVATIVE, MODES, PARTICIPATION, TICK, buy_quantity,
+                       closes_at_limit_down, exit_order, opens_at_limit_up, price_limit, sale_value)
 from trend_pullback_backtest import Setup
 
 ROOT = Path(__file__).resolve().parent / ".cache" / "market-data"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SLOTS = 20
+# Rebalancing skips trades smaller than this share of the starting capital. Without
+# it, rounding noise (about 1e-16) creates dust trades whose count changes between
+# runs, because Python orders sets of codes differently in every process.
+MIN_TRADE = 1e-12
 FEATURES = {"open", "close", "high", "low", "amount", "factor"}
-STOCK_CODE = re.compile(r"(?:sh(?:60|68)|sz(?:00|30)|bj(?:43|82|83|87|88|92))[0-9]{4}$")
+STOCK_CODE = re.compile(rf"(?:sh(?:60|68)|sz(?:00|30)|bj(?:{'|'.join(BEIJING_PREFIXES)}))[0-9]{{4}}$")
 # These three were suspended before BSE opened and remained suspended until transfer.
 SUSPENDED_BSE_TRANSFERS = {"bj832317", "bj833874", "bj833994"}
 TOPIC_WORDS = {
@@ -342,8 +356,34 @@ def breakout_signals(stock):
     return [(indices[i], Setup(float(close[i]), float(stops[i - 9]))) for i in where]
 
 
-def eligible_for_entry(stock, index, setup):
+def limit_masks(stocks, days):
+    """Conservative-mode blocks per stock: (no_buy_at_open, no_sale) boolean arrays.
+
+    The limit is set by the previous traded close. Raw prices are adjusted prices
+    divided by factor, so one 0.01-yuan tick is TICK * factor in adjusted units."""
+    switch = bisect_left(days, CHINEXT_WIDER_LIMIT)
+    masks = {}
+    for code, stock in stocks.items():
+        opening, close = stock.bars[:, 0].astype(np.float64), stock.bars[:, 1].astype(np.float64)
+        last = np.where(np.isfinite(close), np.arange(len(close)), -1)
+        np.maximum.accumulate(last, out=last)
+        reference = np.full(len(close), np.nan)
+        reference[1:] = np.where(last[:-1] >= 0, close[last[:-1]], np.nan)
+        limit = np.full(len(close), price_limit(code, days[0]))
+        limit[switch:] = price_limit(code, CHINEXT_WIDER_LIMIT)
+        tolerance = TICK * stock.factor.astype(np.float64)
+        with np.errstate(invalid="ignore"):
+            masks[code] = (opens_at_limit_up(opening, reference, limit, tolerance),
+                           closes_at_limit_down(close, reference, limit, tolerance))
+    return masks
+
+
+def eligible_for_entry(stock, index, setup, blocks=None):
+    """Whether a signal fills at this open. blocks is the stock's limit_masks entry
+    under the conservative rules (no buy at a limit-up open), None under ideal."""
     opening, close, high, low = map(float, stock.bars[index])
+    if blocks is not None and blocks[0][index]:
+        return False
     return high > low and setup.stop < opening <= 2 * setup.close - setup.stop
 
 
@@ -410,10 +450,40 @@ class Holding:
     target: float
     close: float
     pending: bool
+    entry: int = -1
 
 
-def replay(stocks, signals, start, end, selection, slip, delistings=None):
-    cash, nav, trades, counts = 1.0, [], [], Counter()
+def turnover_rate(counts, nav):
+    """One-way turnover over the run: half the traded value over the average portfolio value."""
+    average = sum(nav) / len(nav)
+    return counts["traded"] / 2 / average if average > 0 else 0.0
+
+
+def compare_trades(ideal, careful, masks, days):
+    """How a conservative replay's closed trades differ from the ideal replay of the same run.
+
+    Both arguments are replay logs; trades match on (code, entry session).
+    refused_limit_up: dates of unmatched ideal trades whose entry opened at limit-up.
+    exit_changed: matched entries whose result changed, such as a stop held through
+    a limit-down close."""
+    first = {(trade["code"], trade["entry"]): trade for trade in ideal}
+    second = {(trade["code"], trade["entry"]): trade for trade in careful}
+    shared = first.keys() & second.keys()
+    return {"shared": len(shared), "ideal_only": len(first.keys() - shared),
+            "conservative_only": len(second.keys() - shared),
+            "refused_limit_up": sorted(days[i] for code, i in first.keys() - shared if masks[code][0][i]),
+            "exit_changed": sum(abs(first[key]["return"] - second[key]["return"]) > 1e-9 for key in shared)}
+
+
+def replay(stocks, signals, start, end, selection, slip, delistings=None, *, blocks=None, account=None, log=None):
+    """Trade the signals with at most SLOTS positions of 1/SLOTS of the portfolio each.
+
+    blocks: limit_masks output for the conservative fill rules, None for ideal.
+    account: an account size in yuan; each entry is then capped at PARTICIPATION
+    of the signal's 20-day median turnover (conservative rules).
+    log: a list that receives every closed trade (code, entry and exit session)."""
+    cash, nav, counts = 1.0, [], Counter()
+    trades = log if log is not None else []
     holding = {}
     delistings = delistings or {}
     for i in range(start, end + 1):
@@ -426,7 +496,8 @@ def replay(stocks, signals, start, end, selection, slip, delistings=None):
         for code in existing:
             position = holding[code]
             if delistings.get(code, len(stocks[code].amount)) <= i:
-                trades.append({"return": -1.0, "reason": "delisted_zero_recovery"})
+                trades.append({"code": code, "entry": position.entry, "exit": i, "return": -1.0,
+                               "reason": "delisted_zero_recovery"})
                 del holding[code]
                 continue
             bar = tuple(map(float, stocks[code].bars[i]))
@@ -434,80 +505,117 @@ def replay(stocks, signals, start, end, selection, slip, delistings=None):
             if not isfinite(close):
                 continue
             position.close = close
-            if high <= low:
+            if high <= low or (blocks is not None and blocks[code][1][i]):
+                # No sale today: a one-price bar, or (conservative) a close at limit-down.
                 position.pending |= low <= position.stop
                 continue
             fill = (opening, "stop") if position.pending else exit_order(bar, position.stop, position.target)
             if fill:
                 price, reason = fill
-                proceeds = position.quantity * price * (1 - slip) * (1 - SELL_COST)
+                proceeds = sale_value(position.quantity, price, slip)
                 cash += proceeds
-                trades.append({"return": proceeds / position.cost - 1, "reason": reason})
+                counts["traded"] += proceeds
+                counts["fills"] += 1
+                trades.append({"code": code, "entry": position.entry, "exit": i,
+                               "return": proceeds / position.cost - 1, "reason": reason})
                 del holding[code]
         allowed = selection.get(i - 1, ()) if selection is not None else None
-        for code, setup, _ in signals.get(i, ()):
+        for code, setup, turnover in signals.get(i, ()):
             if not available or opening_cash <= 1e-12:
                 break
             if code in existing or (allowed is not None and code not in allowed):
                 continue
             opening, close, high, low = map(float, stocks[code].bars[i])
-            if not eligible_for_entry(stocks[code], i, setup):
+            if not eligible_for_entry(stocks[code], i, setup, None if blocks is None else blocks[code]):
                 continue
             budget = min(opening_cash, previous_nav / SLOTS)
-            quantity = budget / (opening * (1 + slip)) * (1 - BUY_COST)
+            if account and PARTICIPATION * turnover / account < budget:
+                budget = PARTICIPATION * turnover / account
+                counts["capacity_trimmed"] += 1
+            if budget <= 1e-12:
+                continue
+            quantity = buy_quantity(budget, opening, slip)
             holding[code] = Holding(quantity, budget, setup.stop, 2 * opening - setup.stop,
-                                    close, close <= setup.stop)
+                                    close, close <= setup.stop, i)
             cash -= budget
             opening_cash -= budget
+            counts["traded"] += budget
+            counts["fills"] += 1
             available -= 1
         invested = sum(p.quantity * p.close for p in holding.values())
-        nav.append(cash + invested)
-        counts["held_days"] += invested / nav[-1]
-    counts["open"] = len(holding)
-    return stats(nav, trades, counts, len(nav))
+        equity = cash + invested
+        nav.append(equity)
+        counts["held_days"] += invested / equity if equity > 0 else 0.0
+    for position in holding.values():
+        record_open(counts, position.quantity * position.close, position.cost)
+    report = stats(nav, trades, counts, len(nav))
+    report.update(fills=counts["fills"], turnover=turnover_rate(counts, nav),
+                  capacity_trimmed=counts["capacity_trimmed"])
+    return report
 
 
-def rebalance_pool(stocks, holding, marks, cash, pool, i, slip, resize):
+def rebalance_pool(stocks, holding, marks, cash, pool, i, slip, resize, *, blocks=None, invest=1.0, slots=None,
+                   counts=None):
     """Trade toward equal weight in pool at the open of session i. Returns (cash, retry).
 
     resize rebalances every tradable member; otherwise only names left behind by an
-    earlier session are traded: members not bought yet and former members not sold."""
-    prices = {}
+    earlier session are traded: members not bought yet and former members not sold.
+    Each member's target is invest / max(len(pool), slots) of the portfolio. blocks
+    (conservative rules) refuses buys at a limit-up open and sales on a limit-down close."""
+    counts = Counter() if counts is None else counts
+    prices, buyable, sellable = {}, set(), set()
     for code in holding.keys() | pool:
         opening, _, high, low = map(float, stocks[code].bars[i])
         if high > low:  # traded with a range today; NaN compares False
             prices[code] = opening
-    for code in [code for code in holding if code not in pool and code in prices]:
-        cash += holding.pop(code) * prices[code] * (1 - slip) * (1 - SELL_COST)
+            if blocks is None or not blocks[code][0][i]:
+                buyable.add(code)
+            if blocks is None or not blocks[code][1][i]:
+                sellable.add(code)
+    for code in [code for code in holding if code not in pool and code in sellable]:
+        proceeds = sale_value(holding.pop(code), prices[code], slip)
+        cash += proceeds
+        counts["traded"] += proceeds
+        counts["fills"] += 1
     if pool:
-        goal = (cash + sum(quantity * prices.get(code, marks[code]) for code, quantity in holding.items())) / len(pool)
+        value = cash + sum(quantity * prices.get(code, marks[code]) for code, quantity in holding.items())
+        goal = invest * value / max(len(pool), slots or 0)
         if resize:  # trim overweight names first so the proceeds fund the rest
-            for code in pool & holding.keys() & prices.keys():
+            for code in pool & holding.keys() & sellable:
                 excess = holding[code] - goal / prices[code]
-                if excess > 0:
+                if excess * prices[code] > MIN_TRADE:
                     holding[code] -= excess
-                    cash += excess * prices[code] * (1 - slip) * (1 - SELL_COST)
-        wanted = {code: goal - holding.get(code, 0.0) * prices[code] for code in pool & prices.keys()
+                    proceeds = sale_value(excess, prices[code], slip)
+                    cash += proceeds
+                    counts["traded"] += proceeds
+                    counts["fills"] += 1
+        wanted = {code: goal - holding.get(code, 0.0) * prices[code] for code in pool & buyable
                   if resize or code not in holding}
-        wanted = {code: amount for code, amount in wanted.items() if amount > 0}
+        wanted = {code: amount for code, amount in wanted.items() if amount > MIN_TRADE}
         scale = min(1.0, cash / sum(wanted.values())) if wanted else 0.0
         for code, amount in wanted.items():
             spend = amount * scale
-            if spend <= 0:
+            if spend <= MIN_TRADE:
                 continue
-            holding[code] = holding.get(code, 0.0) + spend / (prices[code] * (1 + slip)) * (1 - BUY_COST)
+            holding[code] = holding.get(code, 0.0) + buy_quantity(spend, prices[code], slip)
             cash -= spend
+            counts["traded"] += spend
+            counts["fills"] += 1
     retry = any(code not in pool for code in holding) or any(code not in holding for code in pool)
     return cash, retry
 
 
-def hold_pool(stocks, start, end, selection, slip, delistings=None):
-    """Baseline: hold the pool itself at equal weight, with no entry or exit rules.
+def hold_pool(stocks, start, end, selection, slip, delistings=None, *, blocks=None, invest=1.0, slots=None):
+    """Baseline: hold the pool itself, with no entry or exit rules.
 
     The pool known at the previous close is bought at the next open. Positions
     drift until the pool changes, then the portfolio is rebalanced at that open.
-    Costs, slippage, tradability (high > low) and delisting write-offs match
-    replay; a name that cannot trade is retried at each following open."""
+    Costs, slippage, tradability (high > low, plus blocks under the conservative
+    rules) and delisting write-offs match replay; a name that cannot trade is
+    retried at each following open.
+    invest: fraction of the portfolio put into the pool; the rest stays in cash.
+    slots: hold a selection already cut to that many names at 1/slots each and
+    trade only names that join or leave, as replay does, instead of rebalancing."""
     delistings = delistings or {}
     cash, holding, marks = 1.0, {}, {}
     target, retry, nav, counts = None, False, [], Counter()
@@ -516,8 +624,10 @@ def hold_pool(stocks, start, end, selection, slip, delistings=None):
             del holding[code]
         pool = selection.get(i - 1, frozenset())
         if pool != target or retry:
-            counts["rebalances"] += pool != target
-            cash, retry = rebalance_pool(stocks, holding, marks, cash, pool, i, slip, resize=pool != target)
+            changed = pool != target
+            counts["rebalances"] += changed
+            cash, retry = rebalance_pool(stocks, holding, marks, cash, pool, i, slip, resize=changed and not slots,
+                                         blocks=blocks, invest=invest, slots=slots, counts=counts)
             target = pool
         for code in holding:
             close = float(stocks[code].bars[i, 1])
@@ -528,7 +638,25 @@ def hold_pool(stocks, start, end, selection, slip, delistings=None):
         counts["held_days"] += invested / nav[-1] if nav[-1] > 0 else 0.0
     report = stats(nav, [], counts, len(nav))
     return {"return": report["return"], "max_drawdown": report["max_drawdown"],
-            "exposure": report["exposure"], "rebalances": counts["rebalances"]}
+            "exposure": report["exposure"], "rebalances": counts["rebalances"],
+            "fills": counts["fills"], "turnover": turnover_rate(counts, nav)}
+
+
+def slot_pools(selection, activity, start, end, slots=SLOTS):
+    """Cut each day's pool to at most `slots` names for the slot_hold baseline.
+
+    A name stays while it remains in the pool. Free places go to the members with
+    the highest 20-day median turnover at that close, the order replay gives
+    competing signals."""
+    chosen, output = set(), {}
+    for i in range(start - 1, end):
+        pool = selection.get(i, frozenset())
+        chosen &= pool
+        if len(chosen) < slots:
+            ranked = sorted(pool - chosen, key=lambda code: (-float(activity[code][0][i]), code))
+            chosen |= set(ranked[:slots - len(chosen)])
+        output[i] = frozenset(chosen)
+    return output
 
 
 def load_stock_metadata(path):
@@ -563,8 +691,8 @@ def mask_before_listing(stocks, metadata, days):
             stock.factor[:first] = np.nan
 
 
-def all_symbol_trades(stocks, signals, days, start, end, slip, delistings):
-    """Check every ticker independently with the previous execution rules."""
+def all_symbol_trades(stocks, signals, days, start, end, slip, delistings, blocks=None):
+    """Check every ticker independently with replay's execution rules."""
     by_code = defaultdict(dict)
     for i, group in signals.items():
         if start <= i <= end:
@@ -583,19 +711,19 @@ def all_symbol_trades(stocks, signals, days, start, end, slip, delistings):
                     position = None
                     break
                 opening, close, high, low = map(float, stock.bars[i])
-                if high > low:
+                if high > low and not (blocks is not None and blocks[code][1][i]):
                     sale = (opening, "stop") if position.pending else exit_order(
                         (opening, close, high, low), position.stop, position.target)
                     if sale:
-                        trades.append(position.quantity * sale[0] * (1 - slip) * (1 - SELL_COST) - 1)
+                        trades.append(sale_value(position.quantity, sale[0], slip) - 1)
                         position = None
                 elif isfinite(low) and low <= position.stop:
                     position.pending = True
                 continue
             setup = planned.get(i)
-            if setup and eligible_for_entry(stock, i, setup):
+            if setup and eligible_for_entry(stock, i, setup, None if blocks is None else blocks[code]):
                 opening, close, _, _ = map(float, stock.bars[i])
-                position = Holding((1 - BUY_COST) / (opening * (1 + slip)), 1, setup.stop,
+                position = Holding(buy_quantity(1.0, opening, slip), 1, setup.stop,
                                    2 * opening - setup.stop, close, close <= setup.stop)
                 counted_codes.add(code)
         n_open += position is not None
@@ -652,27 +780,46 @@ def main():
         words = {word: theme for theme, terms in TOPIC_WORDS.items() for word in terms}
         topics = news_topics(articles, days, words)
         aggressive = hot_stock_pools(stocks, activity, histories, topics, days)
+    masks = limit_masks(stocks, days)
     report = {"coverage": coverage, "start": days[start], "end": days[end], "slots": SLOTS,
+              "execution": {"modes": list(MODES), "participation": PARTICIPATION, "account_yuan": ACCOUNT},
               "news_archive": archive,
-              "all_signals": all_symbol_trades(stocks, signals, days, start, end, 0, delistings), "runs": []}
+              "all_signals": all_symbol_trades(stocks, signals, days, start, end, 0, delistings),
+              "all_signals_conservative": all_symbol_trades(stocks, signals, days, start, end, 0, delistings, masks),
+              "runs": []}
     windows = [(start, end)]
     if topics:
         common = (max(start, min(topics) + 1), min(end, max(topics)))
         if common[0] <= common[1] and common not in windows:
             windows.append(common)
-    for first, last in windows:
-        for slip in (0, 0.0005):
-            entry = {"start": days[first], "end": days[last], "slippage": slip}
-            for name, pool in (("all", None), ("steady", steady), ("aggressive", aggressive)):
-                if name == "steady" and pool is None:
-                    continue
-                if name == "aggressive" and (pool is None or first - 1 not in pool or last - 1 not in pool):
-                    continue
-                entry[name] = replay(stocks, signals, first, last, pool, slip, delistings)
-                if pool is not None:
-                    entry[name]["mean_pool_size"] = float(np.mean([len(pool.get(i - 1, ())) for i in range(first, last + 1)]))
-                    entry[name]["buy_and_hold"] = hold_pool(stocks, first, last, pool, slip, delistings)
-            report["runs"].append(entry)
+    ideal_logs = {}
+    for mode in MODES:  # ideal first: each conservative run is compared with its ideal twin
+        blocks, account = (masks, ACCOUNT) if mode == CONSERVATIVE else (None, None)
+        for first, last in windows:
+            for slip in (0, 0.0005):
+                entry = {"start": days[first], "end": days[last], "slippage": slip, "execution": mode}
+                for name, pool in (("all", None), ("steady", steady), ("aggressive", aggressive)):
+                    if name == "steady" and pool is None:
+                        continue
+                    if name == "aggressive" and (pool is None or first - 1 not in pool or last - 1 not in pool):
+                        continue
+                    log = []
+                    rule = replay(stocks, signals, first, last, pool, slip, delistings, blocks=blocks, account=account,
+                                  log=log)
+                    if mode == CONSERVATIVE:
+                        rule["versus_ideal"] = compare_trades(ideal_logs[first, last, slip, name], log, masks, days)
+                    else:
+                        ideal_logs[first, last, slip, name] = log
+                    entry[name] = rule
+                    if pool is None:
+                        continue
+                    rule["mean_pool_size"] = float(np.mean([len(pool.get(i - 1, ())) for i in range(first, last + 1)]))
+                    rule["buy_and_hold"] = hold_pool(stocks, first, last, pool, slip, delistings, blocks=blocks)
+                    rule["slot_hold"] = hold_pool(stocks, first, last, slot_pools(pool, activity, first, last), slip,
+                                                  delistings, blocks=blocks, slots=SLOTS)
+                    rule["exposure_hold"] = hold_pool(stocks, first, last, pool, slip, delistings, blocks=blocks,
+                                                      invest=rule["exposure"])
+                report["runs"].append(entry)
     report["hot_topics"] = {days[i]: values for i, values in topics.items()}
     report["pools"] = {
         "steady_month_end": {days[i]: sorted(pool) for i, pool in (steady or {}).items()

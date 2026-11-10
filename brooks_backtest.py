@@ -1,7 +1,9 @@
 """Run the standalone daily-bar Brooks H2 experiment on a saved price snapshot.
 
 Usage: python3 brooks_backtest.py [snapshot.json]
-The snapshot contains a calendar and stocks with date-keyed [open, close, high, low] rows.
+The snapshot contains a calendar and stocks with date-keyed [open, close, high, low]
+rows (python3 build_price_snapshot.py rebuilds it). Every window is reported under
+the ideal and the conservative fill rules described in execution.py.
 """
 
 import argparse
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, median
 
-from backtest_picker import BUY_COST, SELL_COST
+from execution import CONSERVATIVE, IDEAL, MODES, buy_quantity, exit_order, sale_value, snapshot_blocks
 
 BREAKOUT_LOOKBACK = 20
 MAX_PULLBACK = 20
@@ -101,20 +103,6 @@ def scan(rows):
     return orders, confirmed_lows
 
 
-def exit_order(bar, stop, target):
-    """Resolve gaps at the open. With two intraday touches assume stop first."""
-    opening, _, high, low = bar
-    if opening <= stop:
-        return opening, "stop"
-    if target is not None and opening >= target:
-        return opening, "target"
-    if low <= stop:
-        return stop, "stop"
-    if target is not None and high >= target:
-        return target, "target"
-    return None
-
-
 @dataclass
 class Position:
     entry_day: str
@@ -127,7 +115,17 @@ class Position:
     candidate: tuple | None = None
 
 
-def simulate(rows, orders, pivots, sessions, prior, *, strong, trail, slip):
+def record_open(counts, value, cost):
+    """Mark a position still held on the last session: value at the last close vs its cost."""
+    counts["open"] += 1
+    counts["open_value"] += value
+    counts["open_cost"] += cost
+    counts["open_losing"] += value < cost
+
+
+def simulate(rows, orders, pivots, sessions, prior, *, strong, trail, slip, blocks=None):
+    """blocks: conservative-mode {day: (no_buy_at_open, no_sale)} from execution.snapshot_blocks."""
+    blocks = blocks or {}
     cash, position, last_close = 1.0, None, None
     nav, trades, counts = [], [], Counter()
     high_before = {}
@@ -138,17 +136,18 @@ def simulate(rows, orders, pivots, sessions, prior, *, strong, trail, slip):
             opening, close, high, low = bar
             last_close = close
             tradable = high > low
+            no_buy, no_sale = blocks.get(day, (False, False))
             if position:
                 target = None if trail else position.peak
                 fill = None
-                if tradable:
+                if tradable and not no_sale:
                     fill = ((opening, "stop") if position.pending_stop
                             else exit_order(bar, position.stop, target))
                 elif low <= position.stop:
                     position.pending_stop = True
                 if fill:
                     price, reason = fill
-                    cash = position.quantity * price * (1 - slip) * (1 - SELL_COST)
+                    cash = sale_value(position.quantity, price, slip)
                     trades.append({
                         "entry": position.entry_day,
                         "exit": day,
@@ -159,13 +158,13 @@ def simulate(rows, orders, pivots, sessions, prior, *, strong, trail, slip):
                     })
                     position = None
 
-            if not started_in_position and tradable:
+            if not started_in_position and tradable and not no_buy:
                 order = orders.get(prior[day])
                 if order and (not strong or order.strong) and high > order.trigger:
                     price = max(opening, order.trigger) * (1 + slip)
                     if opening > order.stop and price < order.peak and price <= high:
-                        position = Position(day, price, cash, cash / price * (1 - BUY_COST),
-                                            order.stop, order.peak)
+                        quantity = buy_quantity(cash, max(opening, order.trigger), slip)
+                        position = Position(day, price, cash, quantity, order.stop, order.peak)
                         # A close below the stop confirms the breach after entry.
                         # T+1 makes the next executable open the earliest sale.
                         position.pending_stop = close <= order.stop
@@ -195,11 +194,13 @@ def simulate(rows, orders, pivots, sessions, prior, *, strong, trail, slip):
 
         nav.append(cash if position is None else position.quantity * last_close)
         counts["held_days"] += int(position is not None)
-    counts["open"] += int(position is not None)
+    if position:
+        record_open(counts, position.quantity * last_close, position.entry_cash)
     return nav, trades, counts
 
 
-def buy_and_hold(rows, sessions, slip):
+def buy_and_hold(rows, sessions, slip, blocks=None):
+    blocks = blocks or {}
     quantity = 0.0
     nav, last_close = [], None
     held_days = 0
@@ -207,14 +208,23 @@ def buy_and_hold(rows, sessions, slip):
         bar = rows.get(day)
         if bar:
             opening, last_close, high, low = bar
-            if not quantity and high > low:
-                quantity = (1 - BUY_COST) / (opening * (1 + slip))
+            if not quantity and high > low and not blocks.get(day, (False, False))[0]:
+                quantity = buy_quantity(1.0, opening, slip)
         nav.append(quantity * last_close if quantity else 1.0)
         held_days += bool(quantity)
-    return nav, Counter(held_days=held_days, open=int(bool(quantity)))
+    counts = Counter(held_days=held_days)
+    if quantity:
+        record_open(counts, quantity * last_close, 1.0)
+    return nav, counts
 
 
-def stats(nav, trades, counts, capital_days):
+def stats(nav, trades, counts, capital_days, capital=1):
+    """Portfolio and trade statistics.
+
+    capital is the starting capital behind nav in units of 1.0 (the number of
+    sleeves averaged). Win rate, mean trade and profit factor cover closed trades
+    only; positions still held at the end show up in open, open_losing and
+    unrealized_return (their value at the last close minus their cost)."""
     returns = [trade["return"] for trade in trades]
     wins = [value for value in returns if value > 0]
     losses = [value for value in returns if value < 0]
@@ -222,8 +232,11 @@ def stats(nav, trades, counts, capital_days):
     for value in nav:
         peak = max(peak, value)
         drawdown = min(drawdown, value / peak - 1)
+    unrealized = (counts["open_value"] - counts["open_cost"]) / capital
     return {
         "return": nav[-1] - 1,
+        "realized_return": nav[-1] - 1 - unrealized,
+        "unrealized_return": unrealized,
         "max_drawdown": drawdown,
         "trades": len(trades),
         "win_rate": len(wins) / len(returns) if returns else None,
@@ -233,33 +246,36 @@ def stats(nav, trades, counts, capital_days):
         "exits": dict(Counter(trade["reason"] for trade in trades)),
         "stop_raises": counts["stop_raises"],
         "open": counts["open"],
+        "open_losing": counts["open_losing"],
     }
 
 
-def run(stocks, calendar, start, end, slip):
+def run(stocks, calendar, start, end, slip, blocks=None):
+    """blocks: {code: snapshot_blocks(stock)} for the conservative fill rules, None for ideal."""
     prior = dict(zip(calendar[1:], calendar))
     sessions = [day for day in calendar if start <= day <= end]
     assert sessions and sessions[0] in prior
     count_days = len(sessions) * len(stocks)
+    blocks = blocks or {}
     hold_sleeves, hold_counts = [], Counter()
-    for rows, _, _ in stocks.values():
-        nav, stock_counts = buy_and_hold(rows, sessions, slip)
+    for code, (rows, _, _) in stocks.items():
+        nav, stock_counts = buy_and_hold(rows, sessions, slip, blocks.get(code))
         hold_sleeves.append(nav)
         hold_counts.update(stock_counts)
-    results = {"hold": stats(list(map(mean, zip(*hold_sleeves))), [], hold_counts, count_days)}
+    results = {"hold": stats(list(map(mean, zip(*hold_sleeves))), [], hold_counts, count_days, len(stocks))}
     tape = {}
     for strong in (False, True):
         for trail in (False, True):
             name = ("strong" if strong else "all") + ("_trail" if trail else "_peak")
             sleeves, trades, counts = [], [], Counter()
             for code, (rows, orders, pivots) in stocks.items():
-                nav, closed, stock_counts = simulate(
-                    rows, orders, pivots, sessions, prior, strong=strong, trail=trail, slip=slip)
+                nav, closed, stock_counts = simulate(rows, orders, pivots, sessions, prior, strong=strong,
+                                                     trail=trail, slip=slip, blocks=blocks.get(code))
                 sleeves.append(nav)
                 trades.extend({"code": code, **trade} for trade in closed)
                 counts.update(stock_counts)
             tape[name] = trades
-            results[name] = stats(list(map(mean, zip(*sleeves))), trades, counts, count_days)
+            results[name] = stats(list(map(mean, zip(*sleeves))), trades, counts, count_days, len(stocks))
 
     paired = {}
     for quality in ("all", "strong"):
@@ -272,9 +288,13 @@ def run(stocks, calendar, start, end, slip):
         paired[quality] = {"count": len(common),
                            "mean_difference": mean(differences) if differences else None,
                            "median_difference": median(differences) if differences else None,
-                           "trail_better": sum(value > 1e-12 for value in differences)}
+                           "trail_better": sum(value > 1e-12 for value in differences),
+                           # Closed in one version only: the other was still holding an
+                           # earlier entry, or this entry was still open at the end.
+                           "unmatched": {method: len(returns[method].keys() - common)
+                                         for method in ("peak", "trail")}}
     return {"start": sessions[0], "end": sessions[-1], "days": len(sessions), "slippage": slip,
-            "results": results, "paired_exits": paired}, tape
+            "execution": CONSERVATIVE if blocks else IDEAL, "results": results, "paired_exits": paired}, tape
 
 
 def main():
@@ -288,15 +308,20 @@ def main():
         rows = stock["rows"]
         orders, pivots = scan(rows)
         stocks[code] = rows, orders, pivots
+    try:
+        blocks = {code: snapshot_blocks(data["stocks"][code]) for code in stocks}
+    except ValueError as error:
+        parser.error(str(error))
     runs = []
-    for start, end, slip in (("2020-01-01", calendar[-1], 0),
-                             ("2020-01-01", "2023-12-31", 0),
-                             ("2024-01-01", calendar[-1], 0),
-                             ("2020-01-01", calendar[-1], 0.0005)):
-        report, tape = run(stocks, calendar, start, end, slip)
-        if not runs:
-            full_period_trades = tape
-        runs.append(report)
+    for mode in MODES:
+        for start, end, slip in (("2020-01-01", calendar[-1], 0),
+                                 ("2020-01-01", "2023-12-31", 0),
+                                 ("2024-01-01", calendar[-1], 0),
+                                 ("2020-01-01", calendar[-1], 0.0005)):
+            report, tape = run(stocks, calendar, start, end, slip, blocks if mode == CONSERVATIVE else None)
+            if not runs:
+                full_period_trades = tape
+            runs.append(report)
     print(json.dumps({"stocks": len(stocks), "bars": sum(len(x[0]) for x in stocks.values()),
                       "runs": runs, "full_period_trades": full_period_trades}, ensure_ascii=False, indent=2))
 
