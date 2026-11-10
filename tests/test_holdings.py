@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import app as market
 import backtest_picker as picker
 from holdings import HoldingFileError, HoldingStore, parse_holding
-from test_picker import WAVY, make_bars, tencent_response
+from test_picker import WAVY, factor_text, make_bars, tencent_response
 
 
 def sina_quote_text(symbol, name, preclose, price):
@@ -89,8 +89,10 @@ class HoldingsApiTests(unittest.TestCase):
             bars = [{"day": "2026-10-29", "open": "1380", "high": "1400", "low": "1375", "close": "1390", "volume": "100"},
                     {"day": "2026-10-30", "open": "1390", "high": "1399", "low": "1385", "close": "1392.05", "volume": "100"}]
             return Mock(json=Mock(return_value=bars)), None
-        if "gtimg" in url:  # 腾讯前复权日线，用来算策略信号
+        if "gtimg" in url:  # 腾讯不复权日线，用来算策略信号
             return tencent_response(params["param"].split(",")[0], WAVY), None
+        if "qfq.js" in url:  # 新浪前复权因子
+            return Mock(text=factor_text("sh600519")), None
         return None, "offline"
 
     def test_add_estimates_missing_price_and_rejects_forms(self):

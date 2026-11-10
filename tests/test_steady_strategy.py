@@ -1,9 +1,10 @@
 import unittest
 from datetime import date, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app as website
 from steady_strategy import breakout_reading, closed_bars, entry_open_passed, pool_period, verified_previous_session
+from test_picker import factor_text, tencent_response
 from trend_pullback_backtest import scan
 
 
@@ -88,3 +89,36 @@ class SteadyStrategyTests(unittest.TestCase):
         self.assertTrue(stock["archived"])
         self.assertTrue(stock["signal"]["entry_passed"])
         self.assertNotIn("entry_passed", row["archived"])  # 快照带缓存，不能改到缓存里的原对象
+
+    def test_live_bars_are_adjusted_with_sina_factors(self):
+        bars = rising_bars()
+        factors = (("1900-01-01", 1.25), (bars[60]["date"], 1.0))
+
+        def fake_get(url, params=None, headers=None, timeout=8, retries=1):
+            if "qfq.js" in url:
+                return Mock(text=factor_text("sh600900", factors)), None
+            if "gtimg" in url:
+                return tencent_response("sh600900", bars), None
+            return None, "offline"
+
+        now = datetime(2026, 6, 1, 10, 0, tzinfo=website.CHINA_TZ)
+        website._cache.clear()
+        with patch.object(website, "http_get", side_effect=fake_get):
+            live, source = website.steady_live_bars(1, "600900", now)
+        self.assertEqual(len(live), 121)
+        self.assertAlmostEqual(live[0]["close"], bars[0]["close"] / 1.25)
+        self.assertEqual((live[60]["close"], live[-1]["close"]), (bars[60]["close"], bars[-1]["close"]))
+        self.assertEqual(source, "腾讯财经日线，按新浪复权因子等比前复权")
+        # 日线缓存过期后重新取日线，复权因子直接用缓存，不再请求新浪
+        for key in [key for key in website._cache if key.startswith("steady_bars:")]:
+            del website._cache[key]
+        with patch.object(website, "http_get", side_effect=fake_get) as mocked:
+            self.assertEqual(website.steady_live_bars(1, "600900", now)[0], live)
+        self.assertTrue(mocked.called)
+        self.assertFalse(any("qfq.js" in call.args[0] for call in mocked.call_args_list))
+        # 没有复权因子就不用实时日线，接口会改用本地归档
+        website._cache.clear()
+        no_factors = lambda url, **kwargs: (None, "offline") if "qfq.js" in url else fake_get(url, **kwargs)
+        with patch.object(website, "http_get", side_effect=no_factors):
+            self.assertEqual(website.steady_live_bars(1, "600900", now), ([], None))
+        website._cache.clear()
