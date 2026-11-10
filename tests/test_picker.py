@@ -14,13 +14,29 @@ def make_bars(closes, opens=None, start=date(2025, 1, 1)):
 
 
 def tencent_response(symbol, bars):
+    """腾讯不复权日线的返回格式。"""
     response = Mock()
-    response.json.return_value = {"code": 0, "data": {symbol: {"qfqday": [
+    response.json.return_value = {"code": 0, "data": {symbol: {"day": [
         [b["date"], str(b["open"]), str(b["close"]), str(b["high"]), str(b["low"]), "1000"] for b in bars]}}}
     return response
 
 
+def factor_text(symbol, factors=(("1900-01-01", 1.0),)):
+    """新浪前复权因子文件：一段 JSON，后面跟一行签名注释。默认没有除权，因子都是 1。"""
+    rows = ",".join(f'{{"d":"{day}", "f":"{value}"}}' for day, value in factors)
+    return f'var {symbol}qfq={{"total":{len(factors)},"data":[{rows}]}}\n/* K8TroKQUGT+KcYCGPHgU */'
+
+
 WAVY = make_bars([10 + (i % 30) * 0.2 for i in range(300)])
+
+
+def fake_source(factors=(("1900-01-01", 1.0),), bars=WAVY):
+    """按网址返回腾讯不复权日线或新浪复权因子。"""
+    def get(url, params=None, timeout=8, **_):
+        if "qfq.js" in url:
+            return Mock(text=factor_text(url.rsplit("/", 2)[-2], factors)), None
+        return tencent_response(params["param"].split(",")[0], bars), None
+    return Mock(side_effect=get)
 
 
 class StrategyTests(unittest.TestCase):
@@ -86,6 +102,64 @@ class BacktestTests(unittest.TestCase):
                          ["2025-01-02", "2025-01-03"])
         self.assertEqual(picker.parse_tencent_kline({"data": "error"}, "sz000001"), [])
 
+    def test_tencent_bars_come_from_unadjusted_day_only(self):
+        # 只读不复权的 day；腾讯减法前复权的 qfqday 即使出现也不用，否则会再乘一遍新浪因子
+        body = {"data": {"sh600000": {"qfqday": [["2025-01-02", "1", "1", "1", "1", "100"]],
+                                      "day": [["2025-01-02", "10", "11", "11", "9", "100"]]}}}
+        self.assertEqual(picker.parse_tencent_kline(body, "sh600000")[0]["close"], 11)
+        self.assertEqual(picker.parse_tencent_kline({"data": {"sh600000": {"qfqday": body["data"]["sh600000"]["qfqday"]}}},
+                                                    "sh600000"), [])
+
+
+class AdjustmentTests(unittest.TestCase):
+    def test_factor_file_is_parsed_in_date_order(self):
+        text = ('var sh601088qfq={"total":3,"data":[{"d":"2026-10-26", "f":"1.0000000000000000"},'
+                '{"d":"2026-07-13", "f":"1.0199106054449000"},{"d":"1900-01-01", "f":"1.0455265021435000"}]}\n'
+                '/* K8TroKQUGT+KcYCGPHgU++IsFJz6aBGJNr */')
+        self.assertEqual(picker.parse_qfq_factors(text),
+                         [("1900-01-01", 1.0455265021435), ("2026-07-13", 1.0199106054449), ("2026-10-26", 1.0)])
+        broken = ("<html><title>404 Not Found</title></html>", "", None,
+                  'var x={"data":[{"d":"bad", "f":"1"},{"d":"2026-01-01", "f":"0"},{"d":"2026-01-02"}]}')
+        for text in broken:
+            self.assertEqual(picker.parse_qfq_factors(text), [])
+
+    def test_proportional_adjustment_counts_a_dividend_once(self):
+        # 10 元买入，涨到 20 元后每股分红 2 元、除息价 18 元：持有收益是 (18 + 2) / 10 - 1 = 100%。
+        # 腾讯式减法复权会把起点压到 10 - 2 = 8 元，算成 18 / 8 - 1 = 125%。
+        raw = make_bars([10, 20, 18], start=date(2026, 1, 1))
+        factors = [("1900-01-01", 20 / 18), ("2026-01-03", 1.0)]
+        adjusted = picker.forward_adjust(raw, factors)
+        self.assertAlmostEqual(adjusted[-1]["close"] / adjusted[0]["close"] - 1, 1.0)
+        self.assertEqual(adjusted[-1]["close"], 18)  # 最后一根保持真实成交价
+        self.assertEqual(raw[0]["close"], 10)        # 不改动原始数据
+        # 因子表里已经列出未来的除权日时，最后一根仍是真实成交价
+        later = picker.forward_adjust(raw, factors + [("2026-02-02", 0.9)])
+        self.assertEqual(later[-1]["close"], 18)
+        self.assertIsNone(picker.forward_adjust(raw, []))
+        self.assertIsNone(picker.forward_adjust(raw, [("2026-01-02", 1.0)]))  # 覆盖不到最早一根
+
+    def test_factor_url_uses_the_exchange_prefix(self):
+        get = Mock(return_value=(None, "offline"))
+        for market_id, code, symbol in ((1, "600519", "sh600519"), (0, "000001", "sz000001"), (0, "430047", "bj430047"),
+                                        (0, "920002", "bj920002")):
+            self.assertEqual(picker.fetch_qfq_factors(get, market_id, code), [])
+            self.assertEqual(get.call_args.args[0], picker.SINA_QFQ_FACTORS.format(symbol=symbol))
+
+    def test_beijing_codes(self):
+        for code, expected in (("920002", True), ("bj430047", True), ("830799", True), ("870204", True),
+                               ("600519", False), ("300750", False), ("000001", False), ("688981", False)):
+            with self.subTest(code=code):
+                self.assertEqual(picker.beijing_stock(code), expected)
+
+    def test_source_label(self):
+        rows = [{"source": "tencent", "adjusted": True}, {"source": "tencent", "adjusted": True}]
+        self.assertEqual(picker.bars_source_label(rows), "腾讯财经日线，按新浪复权因子等比前复权")
+        rows[1] = {"source": "sina", "adjusted": False}
+        self.assertEqual(picker.bars_source_label(rows),
+                         "腾讯财经日线（1 只改用新浪日线），按新浪复权因子等比前复权；1 只复权因子暂不可用，按不复权价计算")
+        self.assertEqual(picker.bars_source_label([{"source": "sina", "adjusted": False}]),
+                         "新浪财经日线（腾讯行情暂不可用），复权因子暂不可用，按不复权价计算")
+
 
 class PickStocksTests(unittest.TestCase):
     def setUp(self):
@@ -98,28 +172,66 @@ class PickStocksTests(unittest.TestCase):
                                   fallback=fallback, workers=1)
 
     def test_uses_adjusted_bars_once_for_all_windows(self):
-        get = Mock(side_effect=lambda url, params=None, timeout=8:
-                   (tencent_response(params["param"].split(",")[0], WAVY), None))
+        get = fake_source()
         rows, failed, skipped = self.run_pick(get)
         self.assertEqual(([row["code"] for row in rows], failed, skipped), (["300750", "600519"], [], []))
-        self.assertTrue(all(row["adjusted"] and row["days"] == 250 for row in rows))
-        self.assertEqual(get.call_args_list[0].kwargs["params"]["param"], "sz300750,day,,,525,qfq")
+        self.assertTrue(all(row["adjusted"] and row["source"] == "tencent" and row["days"] == 250 for row in rows))
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["param"], "sz300750,day,,,525,")  # 不复权
+        self.assertEqual(get.call_args_list[1].args[0], picker.SINA_QFQ_FACTORS.format(symbol="sz300750"))
         picker.pick_stocks(get, self.cache.get, self.cache.__setitem__, self.stocks, "half", workers=1)
-        self.assertEqual(get.call_count, 2)  # 换区间直接用缓存，不重复请求
+        self.assertEqual(get.call_count, 4)  # 每只一次日线、一次因子；换区间直接用缓存，不重复请求
+
+    def test_bars_are_adjusted_with_sina_factors(self):
+        # 第 200 根那天除权：之前每根按 0.9 折算，之后保持原价
+        self.run_pick(fake_source(factors=(("1900-01-01", 1 / 0.9), (WAVY[200]["date"], 1.0))))
+        bars = self.cache["pick_kline:300750"]["bars"]
+        self.assertAlmostEqual(bars[0]["close"], WAVY[0]["close"] * 0.9)
+        self.assertAlmostEqual(bars[199]["open"], WAVY[199]["open"] * 0.9)
+        self.assertEqual((bars[200]["close"], bars[-1]["close"]), (WAVY[200]["close"], WAVY[-1]["close"]))
 
     def test_falls_back_to_unadjusted_source(self):
         rows, failed, _ = self.run_pick(Mock(return_value=(None, "HTTPError: 501")), Mock(return_value=WAVY))
         self.assertEqual((len(rows), failed), (2, []))
         self.assertFalse(any(row["adjusted"] for row in rows))
+        self.assertTrue(all(row["source"] == "sina" for row in rows))
+        self.assertEqual(self.cache, {})  # 没复权的日线不缓存，下次重新尝试
         _, failed, _ = picker.pick_stocks(Mock(return_value=(None, "offline")), {}.get, lambda *_: None,
                                           self.stocks, "year", workers=1)
         self.assertEqual(len(failed), 2)
 
+    def test_factors_are_cached_apart_from_daily_bars(self):
+        get = fake_source()
+        self.run_pick(get)
+        for key in [key for key in self.cache if key.startswith("pick_kline:")]:
+            del self.cache[key]  # 日线缓存先过期，复权因子还在
+        self.run_pick(get)
+        urls = [call.args[0] for call in get.call_args_list]
+        self.assertEqual(urls.count(picker.TENCENT_KLINE), 4)
+        self.assertEqual(sum("qfq.js" in url for url in urls), 2)
+
+    def test_fallback_bars_with_a_missing_price_are_dropped(self):
+        # 新浪日线把缺失的开盘价记成 0；第 50 根正好是近一年回测的起点，留着会除以 0
+        broken = [dict(bar) for bar in WAVY]
+        broken[50]["open"] = 0.0
+        rows, failed, _ = self.run_pick(Mock(return_value=(None, "HTTPError: 501")), Mock(return_value=broken))
+        self.assertEqual((len(rows), failed), (2, []))
+        self.assertEqual(picker.positive_bars(broken), broken[:50] + broken[51:])
+
+    def test_sina_bars_are_adjusted_when_tencent_is_blocked(self):
+        def get(url, params=None, timeout=8, **_):
+            return (Mock(text=factor_text("sz300750")), None) if "qfq.js" in url else (None, "HTTPError: 501")
+        rows, failed, _ = self.run_pick(Mock(side_effect=get), Mock(return_value=WAVY))
+        self.assertEqual(failed, [])
+        self.assertTrue(all(row["adjusted"] and row["source"] == "sina" for row in rows))
+
     def test_stops_calling_a_blocked_source(self):
         self.stocks = [{"code": f"30000{i}", "market": 0, "name": str(i)} for i in range(6)]
         get = Mock(return_value=(None, "HTTPError: 501"))
-        self.run_pick(get, Mock(return_value=WAVY))
-        self.assertEqual(get.call_count, picker.MAX_SOURCE_FAILURES)
+        rows, _, _ = self.run_pick(get, Mock(return_value=WAVY))
+        urls = [call.args[0] for call in get.call_args_list]
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(urls.count(picker.TENCENT_KLINE), picker.MAX_SOURCE_FAILURES)
+        self.assertEqual(sum("qfq.js" in url for url in urls), picker.MAX_SOURCE_FAILURES)
 
 
 class PicksRouteTests(unittest.TestCase):
@@ -129,6 +241,8 @@ class PicksRouteTests(unittest.TestCase):
 
     @staticmethod
     def fake_get(url, params=None, headers=None, timeout=8, retries=1):
+        if "qfq.js" in url:
+            return Mock(text=factor_text("sz300750")), None
         return tencent_response(params["param"].split(",")[0], WAVY), None
 
     def test_hot_topics(self):
@@ -144,7 +258,7 @@ class PicksRouteTests(unittest.TestCase):
             stock = data["stocks"][0]
             self.assertEqual((stock["code"], stock["market"], stock["topics"]), ("300750", 0, ["固态电池"]))
             self.assertEqual(set(stock["results"]), {"ma_cross", "momentum"})
-            self.assertEqual(data["data_source"], "腾讯财经前复权日线")
+            self.assertEqual(data["data_source"], "腾讯财经日线，按新浪复权因子等比前复权")
             self.assertFalse(data["cached"])
             self.assertTrue(self.client.get("/api/picks?scope=hot&window=year").get_json()["cached"])
         constituents.assert_called_once_with("BK1173", top_n=market.PICK_PER_TOPIC)

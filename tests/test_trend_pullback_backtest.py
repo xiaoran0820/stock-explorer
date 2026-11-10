@@ -1,6 +1,7 @@
 import unittest
 
 from backtest_picker import BUY_COST, SELL_COST
+from brooks_backtest import stats
 from trend_pullback_backtest import Setup, scan, simulate
 
 
@@ -40,3 +41,29 @@ class TrendPullbackBacktestTests(unittest.TestCase):
         self.assertEqual(len(trades), 1)
         self.assertEqual(trades[0]["exit"], "d")
         self.assertAlmostEqual(trades[0]["return"], 10.5 / 10 * (1 - BUY_COST) * (1 - SELL_COST) - 1)
+
+    def test_limit_up_open_cannot_be_bought_under_conservative_rules(self):
+        rows = {"a": (10, 10, 10.2, 9.8), "b": (11, 10.8, 11, 10.5), "c": (10.8, 11, 11.2, 10.7)}
+        args = (rows, {"a": Setup(10, 9)}, {}, "bc", {"b": "a", "c": "b"}, "fixed", 0)
+        _, _, ideal = simulate(*args)
+        _, _, careful = simulate(*args, {"b": (True, False)})
+        self.assertEqual((ideal["open"], careful["open"]), (1, 0))
+
+    def test_limit_down_close_delays_the_stop_under_conservative_rules(self):
+        rows = {"a": (10, 10, 10.2, 9.8), "b": (10.1, 10.2, 10.3, 9.9),
+                "c": (9.8, 9.18, 9.9, 9.18), "d": (9.0, 9.1, 9.3, 8.9)}
+        args = (rows, {"a": Setup(10, 9.5)}, {}, "bcd", dict(zip("bcd", "abc")), "fixed", 0)
+        _, ideal, _ = simulate(*args)
+        _, careful, _ = simulate(*args, {"c": (False, True)})
+        self.assertEqual([(t["exit"], t["reason"]) for t in ideal], [("c", "stop")])
+        self.assertEqual([(t["exit"], t["reason"]) for t in careful], [("d", "stop")])
+        self.assertAlmostEqual(careful[0]["return"], 9.0 / 10.1 * (1 - BUY_COST) * (1 - SELL_COST) - 1)
+
+    def test_position_open_at_the_end_reports_unrealized_return(self):
+        rows = {"a": (10, 10, 10.2, 9.8), "b": (10.1, 10.2, 10.3, 9.9), "c": (10.2, 9.8, 10.3, 9.7)}
+        nav, trades, counts = simulate(rows, {"a": Setup(10, 9.5)}, {}, "bc", {"b": "a", "c": "b"}, "fixed", 0)
+        report = stats(nav, trades, counts, 2)
+        self.assertEqual((report["trades"], report["win_rate"], report["open"], report["open_losing"]),
+                         (0, None, 1, 1))
+        self.assertAlmostEqual(report["unrealized_return"], (1 - BUY_COST) / 10.1 * 9.8 - 1)
+        self.assertAlmostEqual(report["realized_return"], 0)
