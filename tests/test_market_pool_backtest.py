@@ -219,6 +219,44 @@ class ExecutionRuleTests(unittest.TestCase):
         self.assertEqual(result["exits"], {"delisted_zero_recovery": 1})
         self.assertEqual(result["exposure"], 0.5)
 
+    def test_a_paid_out_delisting_is_sold_at_the_last_close(self):
+        # Haitong Securities was absorbed through a share swap: holders were paid, not wiped out.
+        bars = stock([10, 10, 10.2, 9.8], [10.1, 10.2, 10.3, 9.9], [10.2, 10.3, 10.4, 10.1], [10.3, 10.4, 10.5, 10.2])
+        paid = (1 - BUY_COST) / 10.1 * 10.2 * (1 - SELL_COST) - 1  # bought at 10.1, last close 10.2
+        with mock.patch.object(market_pool_backtest, "SLOTS", 1):
+            result = replay({"sh600837": bars}, one_signal("sh600837"), 1, 2, None, 0, {"sh600837": 2})
+        self.assertEqual(result["exits"], {"delisted_paid_out": 1})
+        self.assertAlmostEqual(result["return"], paid)
+        pools = {0: {"sh600837"}, 1: {"sh600837"}}
+        self.assertAlmostEqual(hold_pool({"sh600837": bars}, 1, 2, pools, 0, {"sh600837": 2})["return"], paid)
+        pools = {0: {"sh600000"}, 1: {"sh600000"}}
+        self.assertEqual(hold_pool({"sh600000": bars}, 1, 2, pools, 0, {"sh600000": 2})["return"], -1)
+        # The every-signal check sells at the close before the delisting session, here day 2's 10.3.
+        result = all_symbol_trades({"sh600837": bars}, one_signal("sh600837"), DAYS, 1, 3, 0, {"sh600837": 3})
+        self.assertEqual((result["paid_out_exits"], result["delisted_exits"]), (1, 0))
+        self.assertAlmostEqual(result["mean_trade"], (1 - BUY_COST) / 10.1 * 10.3 * (1 - SELL_COST) - 1)
+        result = all_symbol_trades({"sh600000": bars}, one_signal(), DAYS, 1, 3, 0, {"sh600000": 3})
+        self.assertEqual((result["paid_out_exits"], result["delisted_exits"], result["mean_trade"]), (0, 1, -1))
+
+    def test_a_changed_code_continues_the_old_history(self):
+        # 300114 traded until day 1 and went on as 302132 from day 2, whose factor has another base.
+        old = Stock(np.array([[10, 10, 10.5, 9.5], [10, 11, 11, 10], NAN, NAN]) * 2, np.array([100, 110, 0, 0.0]),
+                    np.array([2, 2, np.nan, np.nan]))
+        new = Stock(np.array([NAN, NAN, [11, 12, 12.5, 10.8], [12, 12.5, 13, 11.9]]) * 1.5,
+                    np.array([0, 0, 120, 125.0]), np.array([np.nan, np.nan, 1.5, 1.5]))
+        stocks = {"sz300114": old, "sz302132": new}
+        with tempfile.TemporaryDirectory() as folder:
+            aliases = market_pool_backtest.reconcile_codes(stocks, Path(folder) / "no-bse-map.csv")
+            path = Path(folder) / "industry.csv"
+            path.write_text("symbol,effective_date,industry\nsz.302132,2025-02-28,C37\nsz.300114,2025-01-27,C39\n")
+            histories = market_pool_backtest.read_industries(path, aliases)
+        self.assertEqual((aliases, set(stocks)), ({"sz300114": "sz302132"}, {"sz302132"}))
+        joined = stocks["sz302132"]
+        np.testing.assert_allclose(joined.bars[:, 1] / joined.factor, [10, 11, 12, 12.5])  # raw closes kept
+        np.testing.assert_allclose(joined.bars[:, 1], [15, 16.5, 18, 18.75])  # one adjusted series
+        np.testing.assert_allclose(joined.amount, [100, 110, 120, 125])
+        self.assertEqual(histories, {"sz302132": [("2025-01-27", "C39"), ("2025-02-28", "C37")]})
+
     def test_open_positions_are_reported_at_their_last_close(self):
         bars = stock([10, 10, 10.2, 9.8], [10.1, 10.2, 10.3, 9.9], [10.2, 9.8, 10.3, 9.7])
         result = replay({"sh600000": bars}, one_signal(), 1, 2, None, 0)
