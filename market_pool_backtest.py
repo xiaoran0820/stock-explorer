@@ -47,6 +47,29 @@ FEATURES = {"open", "close", "high", "low", "amount", "factor"}
 STOCK_CODE = re.compile(rf"(?:sh(?:60|68)|sz(?:00|30)|bj(?:{'|'.join(BEIJING_PREFIXES)}))[0-9]{{4}}$")
 # These three were suspended before BSE opened and remained suspended until transfer.
 SUSPENDED_BSE_TRANSFERS = {"bj832317", "bj833874", "bj833994"}
+# Code changes outside the Beijing exchange's map, old code -> new code.
+CODE_CHANGES = {"sz300114": "sz302132"}  # AVIC Electrical Measurement became AVIC Chengdu Aircraft, 2025-02-17
+# Delistings in which holders were paid: the company was absorbed through a share swap, or left
+# through a voluntary delisting that offered holders a cash option. Such a holding leaves the
+# portfolio at its last traded close; every other delisting is written off at zero.
+PAID_OUT_DELISTINGS = {
+    "sh600317": "Yingkou Port, share swap into Dalian Port (601880), 2021",
+    "sh600068": "Gezhouba, share swap into China Energy Engineering (601868), 2021",
+    "sh600723": "Capital Retailing, share swap into Wangfujing (600859), 2021",
+    "sz000780": "Pingzhuang Energy, share swap into Longyuan Power (001289), 2022",
+    "sz002013": "AVIC Electromechanical, share swap into AVIC Electronics (600372), 2023",
+    "sz000666": "Jingwei Textile Machinery, voluntary delisting, cash option 9.24 yuan, 2023",
+    "sh600213": "Yaxing Coach, voluntary delisting, cash option 6.42 yuan, 2024",
+    "sh600837": "Haitong Securities, share swap into Guotai Junan (601211), 2025",
+    "sh601028": "Yulong, voluntary delisting, cash option 13.20 yuan, 2025",
+    "sh600705": "AVIC Industry-Finance, voluntary delisting, cash option 3.54 yuan, 2025",
+    "sh601989": "China Shipbuilding Industry, share swap into China CSSC (600150), 2025",
+    "sz000627": "Tianmao, voluntary delisting, cash option 1.60 yuan, 2025",
+    "sh603056": "Deppon Logistics, voluntary delisting, cash option 19.00 yuan, 2026",
+    "sh601059": "Cinda Securities, share swap into CICC (601995), 2026",
+    "sh601198": "Dongxing Securities, share swap into CICC (601995), 2026",
+    "sz000016": "Konka, voluntary delisting, cash option 2.48 yuan, 2026",
+}
 TOPIC_WORDS = {
     "A01": ("种业", "种子", "粮食种植", "玉米种植", "小麦种植"),
     "A03": ("生猪", "猪价", "养殖", "肉鸡"),
@@ -167,11 +190,15 @@ def load_market(archive, start, end):
     return sessions, stocks, listings
 
 
-def reconcile_bse(stocks, path):
-    if not path.exists():
-        return {}
-    with path.open() as stream:
-        aliases = {"bj" + row["旧代码"]: "bj" + row["新代码"] for row in csv.DictReader(stream)}
+def reconcile_codes(stocks, path):
+    """Continue the price history of each stock whose code changed under its new code.
+
+    The changes are the Beijing exchange's code map at path plus CODE_CHANGES.
+    Returns {old code: new code} for the other inputs keyed by code."""
+    aliases = dict(CODE_CHANGES)
+    if path.exists():
+        with path.open() as stream:
+            aliases.update({"bj" + row["旧代码"]: "bj" + row["新代码"] for row in csv.DictReader(stream)})
     for old, new in aliases.items():
         if old not in stocks:
             continue
@@ -190,7 +217,7 @@ def reconcile_bse(stocks, path):
         keep = valid & ~later_valid
         if keep.any():
             if not np.isfinite(scale) or scale <= 0:
-                raise ValueError(f"no compatible BSE price scale for {old} -> {new}")
+                raise ValueError(f"no compatible price scale for {old} -> {new}")
             later.bars[keep] = earlier.bars[keep] * scale
             later.factor[keep] = earlier.factor[keep] * scale
             later.amount[keep] = earlier.amount[keep]
@@ -283,12 +310,15 @@ def low_volatility_pool(scores):
     return {code for code, _, _ in ranked[:DIVIDEND_POOL_SIZE]}
 
 
-def read_industries(path):
-    """CSV of exchange-prefixed symbol, effective date, industry label."""
+def read_industries(path, aliases=None):
+    """CSV of exchange-prefixed symbol, effective date, industry label. An old
+    code in aliases is filed under the code its history continues under."""
+    aliases = aliases or {}
     histories = defaultdict(list)
     with path.open() as stream:
         for row in csv.DictReader(stream):
-            histories[code_key(row["symbol"])].append((row["effective_date"], row["industry"]))
+            code = code_key(row["symbol"])
+            histories[aliases.get(code, code)].append((row["effective_date"], row["industry"]))
     return {code: sorted(events) for code, events in histories.items()}
 
 
@@ -496,8 +526,15 @@ def replay(stocks, signals, start, end, selection, slip, delistings=None, *, blo
         for code in existing:
             position = holding[code]
             if delistings.get(code, len(stocks[code].amount)) <= i:
-                trades.append({"code": code, "entry": position.entry, "exit": i, "return": -1.0,
-                               "reason": "delisted_zero_recovery"})
+                if code in PAID_OUT_DELISTINGS:  # paid in shares or cash: leaves at its last close
+                    proceeds = sale_value(position.quantity, position.close, slip)
+                    cash += proceeds
+                    counts["traded"] += proceeds
+                    counts["fills"] += 1
+                    result, reason = proceeds / position.cost - 1, "delisted_paid_out"
+                else:
+                    result, reason = -1.0, "delisted_zero_recovery"
+                trades.append({"code": code, "entry": position.entry, "exit": i, "return": result, "reason": reason})
                 del holding[code]
                 continue
             bar = tuple(map(float, stocks[code].bars[i]))
@@ -605,23 +642,30 @@ def rebalance_pool(stocks, holding, marks, cash, pool, i, slip, resize, *, block
     return cash, retry
 
 
-def hold_pool(stocks, start, end, selection, slip, delistings=None, *, blocks=None, invest=1.0, slots=None):
+def hold_pool(stocks, start, end, selection, slip, delistings=None, *, blocks=None, invest=1.0, slots=None,
+              values=None):
     """Baseline: hold the pool itself, with no entry or exit rules.
 
     The pool known at the previous close is bought at the next open. Positions
     drift until the pool changes, then the portfolio is rebalanced at that open.
     Costs, slippage, tradability (high > low, plus blocks under the conservative
-    rules) and delisting write-offs match replay; a name that cannot trade is
-    retried at each following open.
+    rules) and delistings (written off, or paid out at the last close) match
+    replay; a name that cannot trade is retried at each following open.
     invest: fraction of the portfolio put into the pool; the rest stays in cash.
     slots: hold a selection already cut to that many names at 1/slots each and
-    trade only names that join or leave, as replay does, instead of rebalancing."""
+    trade only names that join or leave, as replay does, instead of rebalancing.
+    values: a list that receives the portfolio value at each close."""
     delistings = delistings or {}
     cash, holding, marks = 1.0, {}, {}
     target, retry, nav, counts = None, False, [], Counter()
     for i in range(start, end + 1):
         for code in [code for code in holding if delistings.get(code, len(stocks[code].amount)) <= i]:
-            del holding[code]
+            quantity = holding.pop(code)
+            if code in PAID_OUT_DELISTINGS:  # paid in shares or cash: leaves at its last close
+                proceeds = sale_value(quantity, marks[code], slip)
+                cash += proceeds
+                counts["traded"] += proceeds
+                counts["fills"] += 1
         pool = selection.get(i - 1, frozenset())
         if pool != target or retry:
             changed = pool != target
@@ -636,6 +680,8 @@ def hold_pool(stocks, start, end, selection, slip, delistings=None, *, blocks=No
         invested = sum(quantity * marks[code] for code, quantity in holding.items())
         nav.append(cash + invested)
         counts["held_days"] += invested / nav[-1] if nav[-1] > 0 else 0.0
+    if values is not None:
+        values.extend(nav)
     report = stats(nav, [], counts, len(nav))
     return {"return": report["return"], "max_drawdown": report["max_drawdown"],
             "exposure": report["exposure"], "rebalances": counts["rebalances"],
@@ -698,7 +744,7 @@ def all_symbol_trades(stocks, signals, days, start, end, slip, delistings, block
         if start <= i <= end:
             for code, setup, _ in group:
                 by_code[code][i] = setup
-    trades, n_open, counted_codes, delisted = [], 0, set(), 0
+    trades, n_open, counted_codes, delisted, paid_out = [], 0, set(), 0, 0
     for code, planned in by_code.items():
         stock = stocks[code]
         position = None
@@ -706,11 +752,17 @@ def all_symbol_trades(stocks, signals, days, start, end, slip, delistings, block
         for i in range(min(planned), end + 1):
             if position:
                 if i >= delisting:
-                    trades.append(-1.0)
-                    delisted += 1
+                    if code in PAID_OUT_DELISTINGS:  # paid in shares or cash: leaves at its last close
+                        trades.append(sale_value(position.quantity, position.close, slip) - 1)
+                        paid_out += 1
+                    else:
+                        trades.append(-1.0)
+                        delisted += 1
                     position = None
                     break
                 opening, close, high, low = map(float, stock.bars[i])
+                if isfinite(close):
+                    position.close = close
                 if high > low and not (blocks is not None and blocks[code][1][i]):
                     sale = (opening, "stop") if position.pending else exit_order(
                         (opening, close, high, low), position.stop, position.target)
@@ -730,7 +782,7 @@ def all_symbol_trades(stocks, signals, days, start, end, slip, delistings, block
     wins = [value for value in trades if value > 0]
     losses = [value for value in trades if value < 0]
     return {"stocks_with_fills": len(counted_codes), "closed_trades": len(trades), "delisted_exits": delisted,
-            "open_trades": n_open, "win_rate": len(wins) / len(trades) if trades else None,
+            "paid_out_exits": paid_out, "open_trades": n_open, "win_rate": len(wins) / len(trades) if trades else None,
             "mean_trade": sum(trades) / len(trades) if trades else None,
             "profit_factor": sum(wins) / -sum(losses) if losses else None}
 
@@ -744,7 +796,7 @@ def main():
     root = args.data
     warmup = (date.fromisoformat(args.start) - timedelta(days=460)).isoformat()
     days, stocks, _ = load_market(root / "qlib_bin.tar.gz", warmup, args.end)
-    aliases = reconcile_bse(stocks, root / "bse-code-map.csv")
+    aliases = reconcile_codes(stocks, root / "bse-code-map.csv")
     start, end = bisect_left(days, args.start), len(days) - 1
     if start >= end:
         parser.error("price archive has no coverage for the requested dates")
@@ -776,7 +828,7 @@ def main():
         if articles:
             archive = {"count": len(articles), "from": min(row[0] for row in articles),
                        "through": max(row[0] for row in articles)}
-        histories = read_industries(industry_file)
+        histories = read_industries(industry_file, aliases)
         words = {word: theme for theme, terms in TOPIC_WORDS.items() for word in terms}
         topics = news_topics(articles, days, words)
         aggressive = hot_stock_pools(stocks, activity, histories, topics, days)

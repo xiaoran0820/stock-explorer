@@ -11,7 +11,7 @@ import numpy as np
 
 from market_pool_backtest import (
     DIVIDEND_MIN_TURNOVER, DIVIDEND_POOL_SIZE, ROOT, dividend_metrics, load_market,
-    load_stock_metadata, mask_before_listing, rank_low_volatility, read_dividends, reconcile_bse,
+    load_stock_metadata, mask_before_listing, rank_low_volatility, read_dividends, reconcile_codes,
 )
 from steady_strategy import SNAPSHOT, breakout_reading
 
@@ -19,7 +19,7 @@ from steady_strategy import SNAPSHOT, breakout_reading
 def build(root, through):
     warmup = (date.fromisoformat(through) - timedelta(days=520)).isoformat()
     days, stocks, _ = load_market(root / "qlib_bin.tar.gz", warmup, through)
-    aliases = reconcile_bse(stocks, root / "bse-code-map.csv")
+    aliases = reconcile_codes(stocks, root / "bse-code-map.csv")
     metadata = load_stock_metadata(root / "stocks.csv")
     mask_before_listing(stocks, metadata, days)
     dividends, bonuses = read_dividends(root / "dividends", aliases)
